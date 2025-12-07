@@ -13,7 +13,7 @@ on:
   workflow_dispatch:
 
 env:
-  # TODO: 修改 1 - 这里改为您的 Docker Hub 用户名/镜像名
+  # TODO: 修改 1 - 这里改为您的 Docker Hub 用户名/镜像名.
   DOCKER_IMAGE: pkcbot123/pkc123bot
   # TODO: 修改 2 - 确认包含您需要支持的所有架构
   PLATFORMS: linux/amd64,linux/arm64
@@ -94,6 +94,7 @@ jobs:
           repository: ${{ env.DOCKER_IMAGE }}
           readme-filepath: ./DOCKER_README.md
           short-description: 'Telegram 云盘自动转存机器人'
+
 
 
 
