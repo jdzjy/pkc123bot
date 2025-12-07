@@ -5,7 +5,7 @@ on:
     types: [published]
 
 env:
-  DOCKER_IMAGE: dydydd/123bot
+  DOCKER_IMAGE: pkc123/pkcbot123
   PLATFORMS: linux/amd64,linux/arm64,linux/arm/v7
 
 jobs:
@@ -58,4 +58,5 @@ jobs:
           repository: ${{ env.DOCKER_IMAGE }}
           readme-filepath: ./DOCKER_README.md
           short-description: 'Telegram 云盘自动转存机器人 - 支持 123/115/189 云盘自动转存、离线下载、秒传和 302 播放'
+
 
