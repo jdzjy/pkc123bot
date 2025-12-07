@@ -223,12 +223,13 @@ class BatchSaveTask:
 
 
 class Cloud189ShareInfo:
-    def __init__(self, shareDirFileId, shareId, shareMode, cloud189Client):
+    def __init__(self, shareDirFileId, shareId, shareMode, cloud189Client, accessCode=""):
         self.shareDirFileId = shareDirFileId
         self.shareId = shareId
         self.session = cloud189Client.session
         self.client = cloud189Client
         self.shareMode = shareMode
+        self.accessCode = accessCode  # [修改] 保存访问码
 
     def getAllShareFiles(self, folder_id=None):
         if folder_id is None:
@@ -237,6 +238,7 @@ class Cloud189ShareInfo:
         folders = []
         pageNumber = 1
         while True:
+            # [修改] params 中必须包含 accessCode
             response = self.session.get("https://cloud.189.cn/api/open/share/listShareDir.action", params={
                 "pageNum": pageNumber,
                 "pageSize": "10000",
@@ -248,12 +250,15 @@ class Cloud189ShareInfo:
                 "iconOption": "5",
                 "orderBy": "lastOpTime",
                 "descending": "true",
-                "accessCode": "",
+                "accessCode": self.accessCode, # [关键] 这里必须传访问码，否则报错
             })
             result = self.client._parse_json(response)
-
+            
             if result.get('res_code') != 0:
-                raise Exception(result.get('res_message', 'Unknown Error'))
+                # 打印更详细的错误日志
+                error_msg = result.get('res_message', 'Unknown Error')
+                log.error(f"获取文件列表失败: {error_msg} (Code: {result.get('res_code')})")
+                raise Exception(error_msg)
             
             if not isinstance(result.get("fileListAO"), dict):
                 log.error(f"Invalid fileListAO format: {result}")
@@ -263,16 +268,24 @@ class Cloud189ShareInfo:
             current_files = fileListAO.get("fileList", [])
             current_folders = fileListAO.get("folderList", [])
             
+            # 如果文件和文件夹都为空，可能是空目录或读取结束
             if fileListAO.get("fileListSize", 0) == 0 and len(current_folders) == 0:
                 break
             
             fileList += current_files
             folders += current_folders
             pageNumber += 1
+            
+            # 简单的防死循环
+            if pageNumber > 1000:
+                log.warning("页数过多，强制停止")
+                break
+                
         return {"files": fileList, "folders": folders}
 
     def saveShareFiles(self, tasksInfos, targetFolderId):
         try:
+            # saveShareFiles 不需要 accessCode，它是基于 taskId 的操作
             response = self.session.post("https://cloud.189.cn/api/open/batch/createBatchTask.action", data={
                 "type": "SHARE_SAVE",
                 "taskInfos": str(tasksInfos),
@@ -293,29 +306,33 @@ class Cloud189ShareInfo:
                 log.error(f"保存文件失败: {result.get('res_message', '未知错误')}")
                 return result.get('res_message', 'UNKNOWN_ERROR')
             
-            return None
+            taskId = result["taskId"]
+            
+            # 轮询检查任务状态
+            while True:
+                response = self.session.post("https://cloud.189.cn/api/open/batch/checkBatchTask.action", data={
+                    "taskId": taskId,
+                    "type": "SHARE_SAVE"
+                })
+                result = self.client._parse_json(response)
+
+                taskStatus = result.get("taskStatus")
+                errorCode = result.get("errorCode")
+                # taskStatus: 4=成功, 3=处理中? (需根据实际抓包调整，通常4是完成)
+                # 原代码逻辑是 !=3 就退出，这里保持原样，如有问题再调整
+                if taskStatus != 3 or errorCode:
+                    break
+                time.sleep(1)
+            
+            return errorCode # 如果errorCode存在则返回，否则返回None表示成功
+            
         except Exception as e:
             log.error(f"保存文件时发生异常: {e}")
             return f"EXCEPTION: {str(e)}"
-        
-        taskId = result["taskId"]
-        while True:
-            response = self.session.post("https://cloud.189.cn/api/open/batch/checkBatchTask.action", data={
-                "taskId": taskId,
-                "type": "SHARE_SAVE"
-            })
-            result = self.client._parse_json(response)
-
-            taskStatus = result.get("taskStatus")
-            errorCode = result.get("errorCode")
-            if taskStatus != 3 or errorCode:
-                break
-            time.sleep(1)
-        return errorCode
 
     def createBatchSaveTask(self, targetFolderId, batchSize, shareFolderId=None, maxWorkers=3):
         return BatchSaveTask(shareInfo=self, batchSize=batchSize, targetFolderId=targetFolderId,
-                             shareFolderId=shareFolderId, maxWorkers=3)
+                             shareFolderId=shareFolderId, maxWorkers=maxWorkers)
 
 
 class Cloud189:
@@ -743,29 +760,56 @@ class Cloud189:
         return all_files
 
 
+# [修改后 V2] 修复部分链接不返回 shareId 导致的报错
     def getShareInfo(self, link):
         url = parse.urlparse(link)
-        try:
-            code = parse.parse_qs(url.query)["code"][0]
-        except (KeyError, IndexError):
-            path_parts = url.path.split('/')
-            if len(path_parts) >= 3 and path_parts[1] == 't':
-                code = path_parts[2]
-            else:
-                raise Exception("无法从分享链接中提取分享码")
+        query_params = parse.parse_qs(url.query)
         
-        response = self.session.get("https://cloud.189.cn/api/open/share/getShareInfoByCodeV2.action", params={
+        # 1. 提取 URL 中的 accessCode
+        access_code = query_params.get('accessCode', [''])[0]
+
+        try:
+            # 2. 提取 shareCode (例如 UzmqYvvANn6r)
+            if "code" in query_params:
+                code = query_params["code"][0]
+            else:
+                path_parts = url.path.split('/')
+                if len(path_parts) >= 3 and path_parts[1] == 't':
+                    code = path_parts[2]
+                else:
+                    code = path_parts[-1]
+        except (KeyError, IndexError):
+             raise Exception("无法从分享链接中提取分享码")
+        
+        # 3. 构造请求参数
+        api_params = {
             "shareCode": code
-        })
+        }
+        if access_code:
+            api_params["accessCode"] = access_code
+
+        # 4. 发起请求
+        response = self.session.get("https://cloud.189.cn/api/open/share/getShareInfoByCodeV2.action", params=api_params)
         result = self._parse_json(response)
 
+        # 5. 错误处理
         if result.get('res_code') != 0:
-            raise Exception(result.get('res_message', 'Unknown Error'))
+            raise Exception(f"获取分享信息失败: {result.get('res_message', '未知错误')} (Code: {result.get('res_code')})")
+
+        real_share_id = result.get("shareId", code)
+        real_file_id = result.get("fileId")
+        real_share_mode = result.get("shareMode", 1)
+
+        if not real_file_id:
+             raise Exception(f"API返回数据异常，未找到文件ID(fileId)。API响应: {result}")
+            
+        # 6. 返回对象
         return Cloud189ShareInfo(
-            shareId=result["shareId"],
-            shareDirFileId=result["fileId"],
+            shareId=real_share_id,
+            shareDirFileId=real_file_id,
             cloud189Client=self,
-            shareMode=result["shareMode"]
+            shareMode=real_share_mode,
+            accessCode=access_code 
         )
 
     def createFolderFromShareLink(self, link, parentFolderId):
@@ -958,12 +1002,28 @@ def get_latest_messages():
         return []
 
 def extract_target_url(text):
-    pattern = r'https?:\/\/cloud\.189\.cn\/(t\/\w+|web\/share\?code=\w+)'
-    matches = re.findall(pattern, text, re.IGNORECASE | re.DOTALL)
-    if matches:
-        unique = list(set([match.strip() for match in matches]))
-        return [f"https://cloud.189.cn/{link}" if not link.startswith("http") else link for link in unique]
-    return []
+    # 1. 匹配标准分享链接
+    pattern = r'https?:\/\/cloud\.189\.cn\/(?:t\/\w+|web\/share\?code=\w+)'
+    links = re.findall(pattern, text, re.IGNORECASE)
+    unique_links = list(set([match.strip() for match in links]))
+    # 2. 提取访问码/提取码
+    code_pattern = r'(?:访问码|提取码)\s*[:：]\s*([a-zA-Z0-9]+)'
+    code_match = re.search(code_pattern, text)
+    access_code = code_match.group(1) if code_match else None
+
+    final_links = []
+    for link in unique_links:
+        if not link.startswith("http"):
+            link = f"https://cloud.189.cn/{link.lstrip('/')}"
+        
+        # 拼接到 URL 参数中
+        if access_code:
+            separator = "&" if "?" in link else "?"
+            link = f"{link}{separator}accessCode={access_code}"
+            
+        final_links.append(link)
+        
+    return final_links
 
 def tg_189monitor(client):
     init_database()
