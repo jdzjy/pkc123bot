@@ -433,6 +433,7 @@ class Cloud189:
         except Exception as e:
             logger.error(f"账号密码登录异常: {e}")
             return False
+        
 
     def getEncrypt(self):
         response = self.session.post("https://open.e.189.cn/api/logbox/config/encryptConf.do", data={
@@ -583,6 +584,164 @@ class Cloud189:
             return self.delete_files(task_infos)
         except Exception as e:
             return {"success": False, "message": f"异常: {str(e)}"}
+        
+
+    # [新增方法] 递归清理指定目录下的空文件夹
+    def delete_empty_folders(self, folder_id):
+        """
+        递归删除指定文件夹下的所有空文件夹（从最底层向上清理）
+        """
+        log.info(f"开始清理文件夹[{folder_id}]下的空目录...")
+        
+        # 1. 获取所有文件夹列表
+        all_folders = []
+        folder_queue = [folder_id]
+        
+        # 广度优先遍历获取所有子文件夹ID
+        while folder_queue:
+            curr = folder_queue.pop(0)
+            try:
+                # 只获取文件夹列表
+                response = self.session.get(
+                    "https://cloud.189.cn/api/open/file/listFiles.action",
+                    params={"folderId": curr, "mediaType": 0, "pageNum": 1, "pageSize": 1000}, # 假设单层文件夹不超过1000
+                    timeout=10
+                )
+                res = self._parse_json(response)
+                
+                folders = res.get("fileListAO", {}).get("folderList", [])
+                for f in folders:
+                    fid = f.get("id") or f.get("fileId")
+                    if fid:
+                        all_folders.append(fid)
+                        folder_queue.append(fid)
+                time.sleep(0.1)
+            except Exception as e:
+                log.error(f"扫描子文件夹失败: {e}")
+
+        # 2. 倒序排列（从最深层开始删）
+        # 由于我们是BFS获取的，列表后面的通常是深层的，倒序即可
+        all_folders.reverse()
+        
+        deleted_count = 0
+        
+        # 3. 逐个检查并删除
+        for fid in all_folders:
+            try:
+                # 检查该文件夹是否为空（既无文件也无子文件夹）
+                response = self.session.get(
+                    "https://cloud.189.cn/api/open/file/listFiles.action",
+                    params={"folderId": fid, "mediaType": 0, "pageNum": 1, "pageSize": 1},
+                    timeout=10
+                )
+                res = self._parse_json(response)
+                count = res.get("fileListAO", {}).get("count", 0)
+                
+                if count == 0:
+                    # 执行删除
+                    self.delete_files([{"fileId": fid, "fileName": "empty_dir", "isFolder": 1}])
+                    deleted_count += 1
+                    # log.info(f"已删除空文件夹: {fid}")
+                    time.sleep(0.2) # 避免太快
+            except Exception as e:
+                log.error(f"清理文件夹{fid}异常: {e}")
+                
+        log.info(f"空文件夹清理完成，共删除 {deleted_count} 个目录")
+        return deleted_count
+
+    def get_folder_files_for_transfer(self, folder_id):
+        """
+        递归获取指定文件夹下的所有文件信息（含MD5）
+        兼容各种字段名缺失的情况
+        """
+        all_files = []
+        
+        # 待扫描的文件夹队列 (初始放入根目录ID)
+        folder_queue = [(folder_id, "/")]
+        
+        scanned_folders = 0
+        MAX_SCANNED_FOLDERS = 500 
+
+        while folder_queue:
+            if scanned_folders >= MAX_SCANNED_FOLDERS:
+                log.warning(f"扫描达到最大文件夹限制 ({MAX_SCANNED_FOLDERS})，停止扫描剩余目录")
+                break
+                
+            current_id, current_path = folder_queue.pop(0)
+            scanned_folders += 1
+            
+            page_num = 1
+            page_size = 200
+            
+            try:
+                while True:
+                    response = self.session.get(
+                        "https://cloud.189.cn/api/open/file/listFiles.action",
+                        params={
+                            "folderId": current_id,
+                            "mediaType": 0,
+                            "orderBy": "lastOpTime",
+                            "descending": True,
+                            "pageNum": page_num,
+                            "pageSize": page_size
+                        },
+                        timeout=15
+                    )
+                    res = self._parse_json(response)
+                    
+                    if res.get("res_code") != 0:
+                        log.error(f"获取天翼云目录[{current_path}]失败: {res.get('res_message')}")
+                        break
+
+                    file_list_ao = res.get("fileListAO", {})
+                    current_file_list = file_list_ao.get("fileList", [])
+                    current_folder_list = file_list_ao.get("folderList", [])
+
+                    # --- 处理文件 ---
+                    if current_file_list:
+                        for file in current_file_list:
+                            # 必须确保有MD5值
+                            if "md5" in file and file["md5"]:
+                                # [全面防御] 对所有字段使用 .get() 
+                                f_name = file.get("fileName") or file.get("name") or "Unknown_File"
+                                # 尝试获取大小，如果都没有则默认为 0
+                                f_size = file.get("fileSize") or file.get("size") or 0
+                                f_id = file.get("id") or file.get("fileId")
+                                
+                                if f_id: # 只有当ID存在时才添加
+                                    all_files.append({
+                                        "file_id": f_id,
+                                        "file_name": f_name,
+                                        "file_size": f_size,
+                                        "md5": file["md5"].lower(),
+                                        "parent_path": current_path
+                                    })
+
+                    # --- 处理文件夹 ---
+                    if page_num == 1 and current_folder_list:
+                        for folder in current_folder_list:
+                            # 文件夹通常使用 'name' 字段
+                            folder_name = folder.get("name") or folder.get("fileName") or "Unknown_Folder"
+                            folder_id = folder.get("id") or folder.get("fileId")
+                            
+                            if folder_id:
+                                sub_path = f"{current_path}{folder_name}/"
+                                folder_queue.append((folder_id, sub_path))
+
+                    # 翻页判断
+                    current_page_count = len(current_file_list) + len(current_folder_list)
+                    if current_page_count < page_size:
+                        break
+                    
+                    page_num += 1
+                    time.sleep(0.2)
+                    
+            except Exception as e:
+                log.error(f"遍历天翼云目录[{current_path}]异常: {str(e)}")
+        
+        log.info(f"天翼云扫描结束: 共扫描 {scanned_folders} 个目录，发现 {len(all_files)} 个有效文件")
+        return all_files
+
 
     def getShareInfo(self, link):
         url = parse.urlparse(link)
