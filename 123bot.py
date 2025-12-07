@@ -781,7 +781,7 @@ def get_latest_messages():
 
 
 def extract_target_url(text):
-    pattern = r'https?:\/\/www\.123(?:\d+|pan)\.\w+\/s\/[\w-]+(?:\?pwd=\w+|(?:\s*提取码\s*[:：]\s*\w+))?'
+    pattern = r'https?:\/\/(?:www\.)?123(?:\d+|pan)\.\w+\/s\/[\w-]+(?:\?pwd=\w+|(?:\s*提取码\s*[:：]\s*\w+))?'
     matches = re.findall(pattern, text, re.IGNORECASE | re.DOTALL)
     if matches:
         # 去除重复链接
