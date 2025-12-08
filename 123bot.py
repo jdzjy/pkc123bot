@@ -2968,27 +2968,143 @@ def handle_general_message(message):
             return
 
         # ... 天翼云盘部分 ...       
-        from bot189 import extract_target_url as  extract_target_url_189
-        from bot189 import save_189_link
+        from bot189 import save_189_link    
+        from bot189 import extract_target_url as extract_target_url_189
+        from bot189 import save_189_link, get_share_file_snapshot
+        
         target_urls = extract_target_url_189(text)
         if target_urls:
-            reply_thread_pool.submit(send_reply_delete, message, f"发现{len(target_urls)}个天翼云盘分享链接，开始转存...")
+            reply_thread_pool.submit(send_reply_delete, message, f"发现{len(target_urls)}个天翼云盘分享链接，正在处理...")
+            
             success_count = 0
             fail_count = 0
+            
+            client123 = init_123_client()
+            
+            # 1. 123云盘目标基础ID (秒传位置)
+            pid_for_123 = os.getenv("ENV_189GO123_UPLOAD_PID", "")
+            if not pid_for_123:
+                pid_for_123 = os.getenv("ENV_123_UPLOAD_PID", "0")
+            
+            # 2. 天翼云目标ID (兜底转存)
+            pid_for_189 = os.getenv("ENV_189_LINK_UPLOAD_PID", "")
+            if not pid_for_189:
+                pid_for_189 = os.getenv("ENV_189_UPLOAD_PID", "-11")
+
+            logger.info(f"189配置 | 123基础ID: {pid_for_123} | 189兜底ID: {pid_for_189}")
+
             for url in target_urls:
-                try:                    
-                    result = save_189_link(client189, url, os.getenv("ENV_189_LINK_UPLOAD_PID","-11"))
-                    if result:
-                        success_count += 1
-                        logger.info(f"转存成功: {url}")
-                    else:
-                        fail_count += 1
-                        logger.error(f"转存失败: {url}")
+                try:
+                    logger.info(f"正在解析天翼云链接元数据: {url}")
+                    # 获取文件快照 + 分享标题(作为根文件夹名)
+                    files_in_share, root_share_name = get_share_file_snapshot(client189, url)
+                    
+                    all_rapid_success = False
+                    
+                    if files_in_share:
+                        total_f = len(files_in_share)
+                        success_f = 0
+                        logger.info(f"解析成功，共 {total_f} 个文件，准备秒传...")
+                        
+                        # [关键] 文件夹ID全局缓存 (避免同一层级重复请求API)
+                        # Key: "父ID_文件夹名", Value: "文件夹ID"
+                        # 放在循环外，确保同一个分享链接内缓存共享
+                        folder_cache = {} 
+                        
+                        for i, f_info in enumerate(files_in_share):
+                            try:
+                                # === [核心逻辑] 构建完整目录链 ===
+                                raw_path = f_info.get('path', '').strip('/')
+                                path_parts = raw_path.split('/')
+                                
+                                # 2. 提取文件名: "007.mp4"
+                                file_name = path_parts.pop() 
+                                
+                                # 3. 构建目录列表: ["我的资源", "动作片", "007系列"]
+                                # 将 "分享标题" 作为第一层，剩下的 path_parts 作为后续层级
+                                dir_chain = []
+                                if root_share_name:
+                                    dir_chain.append(root_share_name)
+                                dir_chain.extend([p for p in path_parts if p]) # 追加剩余路径
+                                
+                                # 4. 逐级递归创建/查找目录
+                                current_pid = pid_for_123 # 从配置的根目录开始
+                                
+                                for folder_name in dir_chain:
+                                    # 生成缓存Key (确保父ID和文件夹名唯一确定一个子文件夹)
+                                    cache_key = f"{current_pid}_{folder_name}"
+                                    
+                                    # A. 查本地缓存 (速度最快，支持嵌套的关键)
+                                    if cache_key in folder_cache:
+                                        current_pid = folder_cache[cache_key]
+                                        continue
+                                    
+                                    # B. 查云端 / 创建
+                                    found_id = find_child_folder_id(client123, current_pid, folder_name)
+                                    if found_id:
+                                        # 存在 -> 记录缓存，进入下一级
+                                        folder_cache[cache_key] = found_id
+                                        current_pid = found_id
+                                    else:
+                                        # 不存在 -> 创建
+                                        try:
+                                            resp = client123.fs_mkdir(folder_name, parent_id=current_pid)
+                                            if resp.get("code") == 0:
+                                                new_id = resp["data"]["Info"]["FileId"]
+                                                folder_cache[cache_key] = new_id
+                                                current_pid = new_id
+                                                logger.info(f"📁 创建目录: {folder_name} (ID: {new_id})")
+                                            else:
+                                                logger.warning(f"⚠️ 创建目录失败: {folder_name} - {resp.get('message')}")
+                                        except Exception:
+                                            pass
+
+                                # === 5. 执行秒传 (到最后一级目录) ===
+                                resp = client123.upload_file_fast(
+                                    file_name=file_name,
+                                    parent_id=current_pid, 
+                                    file_md5=f_info['md5'],
+                                    file_size=f_info['size'],
+                                    duplicate=1
+                                )
+                                
+                                if resp.get("code") == 0 and \
+                                   (resp.get("data", {}).get("Reuse") or resp.get("data", {}).get("reuse")):
+                                    success_f += 1
+                                    
+                            except Exception as e:
+                                logger.error(f"❌ 单文件处理异常 {f_info.get('name')}: {e}")
+                                pass 
+                        
+                        logger.info(f"123直连秒传结果: {success_f}/{total_f}")
+                        
+                        if success_f == total_f and total_f > 0:
+                            all_rapid_success = True
+                            success_count += 1
+                            reply_thread_pool.submit(send_reply, message, f"✅ 123云盘极速秒传成功！\n📁 目录: {root_share_name}\n链接: {url}\n✨ 完美保留多层级目录结构")
+                            continue 
+                    
+                    # 2. 秒传失败，走兜底转存 (保存到 189)
+                    if not all_rapid_success:
+                        logger.info("123秒传未完全覆盖，执行转存到天翼云盘...")
+                        if files_in_share:
+                            reply_thread_pool.submit(send_reply_delete, message, f"⚠️ 123云盘无此资源，正在转存到天翼云盘 (占用空间)...")
+                        
+                        result = save_189_link(client189, url, pid_for_189)
+                        
+                        if result:
+                            success_count += 1
+                            logger.info(f"天翼云转存成功: {url}")
+                            reply_thread_pool.submit(send_reply, message, f"✅ 已转存到天翼云盘 (123秒传失败)\n链接: {url}\n请稍后使用 /sync189 进行同步。")
+                        else:
+                            fail_count += 1
+                            logger.error(f"天翼云转存失败: {url}")
+                            reply_thread_pool.submit(send_reply, message, f"❌ 转存失败: {url}")
+
                 except Exception as e:
                     fail_count += 1
-                    logger.error(f"转存异常: {url}, 错误: {str(e)}")
-            #time.sleep(3)
-            reply_thread_pool.submit(send_reply, message, f"转存完成：成功{success_count}个，失败{fail_count}个")
+                    logger.error(f"处理异常: {url}, 错误: {str(e)}")
+            
             user_state_manager.clear_state(user_id)
             return
 
@@ -4666,7 +4782,7 @@ def check_task():
 
 if __name__ == "__mp_main__":
     from bot115 import tg_115monitor
-    from bot189 import tg_189monitor,Cloud189
+    from bot189 import Cloud189
     client189 = Cloud189()
     ENV_189_CLIENT_ID = os.getenv("ENV_189_CLIENT_ID","")
     ENV_189_CLIENT_SECRET = os.getenv("ENV_189_CLIENT_SECRET","")
@@ -4674,6 +4790,158 @@ if __name__ == "__mp_main__":
     if (ENV_189_CLIENT_ID and ENV_189_CLIENT_SECRET):
         logger.info("天翼云盘正在尝试登录 ...")
         client189.login(ENV_189_CLIENT_ID, ENV_189_CLIENT_SECRET)
+
+# === [重写] 全能版天翼云监控 (集成秒传+目录结构+兜底) ===
+def tg_189monitor(client189):
+    # 引用必要组件
+    from bot189 import init_database, get_latest_messages, save_message, TelegramNotifier
+    from bot189 import TG_BOT_TOKEN, TG_ADMIN_USER_ID, get_share_file_snapshot, save_189_link
+    
+    init_database()
+    notifier = TelegramNotifier(TG_BOT_TOKEN, TG_ADMIN_USER_ID)
+    logger.info("===== 开始检查 天翼网盘监控 (智能秒传版) =====")
+
+    # 1. 获取新消息
+    new_messages = get_latest_messages()
+    if not new_messages:
+        return
+
+    # 2. 初始化 123 客户端
+    client123 = init_123_client()
+
+    # 3. 获取目录配置
+    # 123目标目录 (秒传用)
+    pid_for_123 = os.getenv("ENV_189GO123_UPLOAD_PID", "")
+    if not pid_for_123:
+        pid_for_123 = os.getenv("ENV_123_UPLOAD_PID", "0")
+
+    # 189兜底目录 (转存用)
+    pid_for_189 = os.getenv("ENV_189_LINK_UPLOAD_PID", "")
+    if not pid_for_189:
+        pid_for_189 = os.getenv("ENV_189_UPLOAD_PID", "-11")
+
+    logger.info(f"189监控配置 | 123目标ID: {pid_for_123} | 189兜底ID: {pid_for_189}")
+
+    # 4. 遍历处理新消息
+    for msg in new_messages:
+        message_id, date_str, message_url, target_url, message_text = msg
+        logger.info(f"处理新消息: {target_url}")
+        
+        status = "处理中"
+        result_msg = ""
+        
+        try:
+            # === A. 获取快照 (只读不存) ===
+            files_in_share, root_share_name = get_share_file_snapshot(client189, target_url)
+            
+            all_rapid_success = False
+            
+            if files_in_share:
+                total_f = len(files_in_share)
+                success_f = 0
+                logger.info(f"解析成功，共 {total_f} 个文件，尝试秒传...")
+                
+                # 文件夹缓存 (避免重复API请求)
+                folder_cache = {}
+                
+                # === B. 尝试秒传到 123 (带目录结构) ===
+                for i, f_info in enumerate(files_in_share):
+                    try:
+                        # 1. 路径解析
+                        raw_path = f_info.get('path', '').strip('/')
+                        path_parts = raw_path.split('/')
+                        file_name = path_parts.pop()
+                        
+                        # 2. 构建目录链 (根目录名 + 子目录)
+                        dir_chain = []
+                        if root_share_name:
+                            dir_chain.append(root_share_name)
+                        dir_chain.extend([p for p in path_parts if p])
+                        
+                        # 3. 递归定位目标文件夹ID
+                        current_pid = pid_for_123
+                        
+                        for folder_name in dir_chain:
+                            cache_key = f"{current_pid}_{folder_name}"
+                            if cache_key in folder_cache:
+                                current_pid = folder_cache[cache_key]
+                                continue
+                            
+                            found_id = find_child_folder_id(client123, current_pid, folder_name)
+                            if found_id:
+                                folder_cache[cache_key] = found_id
+                                current_pid = found_id
+                            else:
+                                try:
+                                    resp = client123.fs_mkdir(folder_name, parent_id=current_pid)
+                                    if resp.get("code") == 0:
+                                        new_id = resp["data"]["Info"]["FileId"]
+                                        folder_cache[cache_key] = new_id
+                                        current_pid = new_id
+                                except Exception:
+                                    pass
+
+                        # 4. 执行秒传
+                        resp = client123.upload_file_fast(
+                            file_name=file_name,
+                            parent_id=current_pid,
+                            file_md5=f_info['md5'],
+                            file_size=f_info['size'],
+                            duplicate=1
+                        )
+                        
+                        if resp.get("code") == 0 and \
+                           (resp.get("data", {}).get("Reuse") or resp.get("data", {}).get("reuse")):
+                            success_f += 1
+                            
+                    except Exception as e:
+                        pass
+                
+                logger.info(f"123直连秒传结果: {success_f}/{total_f}")
+                
+                # 全量成功，流程结束
+                if success_f == total_f and total_f > 0:
+                    all_rapid_success = True
+                    status = "转存成功"
+                    result_msg = (
+                        f"✅ 123云盘极速秒传成功！\n"
+                        f"📂 目录: {root_share_name}\n"
+                        f"链接: {target_url}\n"
+                        f"✨ 零流量 | 不占天翼空间"
+                    )
+                    notifier.send_message(result_msg)
+                    save_message(message_id, date_str, message_url, target_url, status, result_msg)
+                    continue # 跳过后续的兜底逻辑
+            
+            # === C. 兜底转存 (存到 189) ===
+            # 如果秒传未覆盖所有文件，则执行老办法
+            if not all_rapid_success:
+                logger.info("123秒传未覆盖，执行兜底转存到天翼云盘...")
+                
+                # 使用专门的 189 兜底目录 ID
+                result = save_189_link(client189, target_url, pid_for_189)
+                
+                if result:
+                    status = "转存成功"
+                    result_msg = (
+                        f"✅ 已转存到天翼云盘 (123秒传失败)\n"
+                        f"链接: {target_url}\n"
+                        f"请稍后使用 /sync189 同步"
+                    )
+                else:
+                    status = "转存失败"
+                    result_msg = (
+                        f"❌ 天翼云转存失败 (空间不足或其他错误)\n"
+                        f"链接: {target_url}"
+                    )
+                
+                notifier.send_message(result_msg)
+                save_message(message_id, date_str, message_url, target_url, status, result_msg)
+
+        except Exception as e:
+            logger.error(f"处理监控消息异常: {e}")
+            save_message(message_id, date_str, message_url, target_url, "报错", f"异常: {e}")
+
 
 def main():     
     from server import app
@@ -4854,7 +5122,11 @@ def main():
                                 logger.error(f"115监控任务出错 (已跳过，防止容器重启): {str(e)}")          
             
             if get_int_env("ENV_189_TGMONITOR_SWITCH", 0):
-                tg_189monitor(client189)
+                try:
+                    # 直接调用本文件定义的 tg_189monitor (上面那个全能版)
+                    tg_189monitor(client189)
+                except Exception as e:
+                    logger.error(f"天翼云监控任务出错: {e}")
             
             logger.info(f"休息{CHECK_INTERVAL}分钟，当前版本 {version}...")
             
