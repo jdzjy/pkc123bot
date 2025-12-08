@@ -240,13 +240,16 @@ class BatchSaveTask:
 
 
 class Cloud189ShareInfo:
-    def __init__(self, shareDirFileId, shareId, shareMode, cloud189Client, accessCode=""):
+    # [修改] 增加 shareCode 和 shareName 参数
+    def __init__(self, shareDirFileId, shareId, shareMode, cloud189Client, accessCode="", shareName="", shareCode=""):
         self.shareDirFileId = shareDirFileId
         self.shareId = shareId
         self.session = cloud189Client.session
         self.client = cloud189Client
         self.shareMode = shareMode
-        self.accessCode = accessCode  # [修改] 保存访问码
+        self.accessCode = accessCode 
+        self.shareName = shareName # 存储文件夹名
+        self.shareCode = shareCode #
 
     def getAllShareFiles(self, folder_id=None):
         if folder_id is None:
@@ -254,36 +257,63 @@ class Cloud189ShareInfo:
         fileList = []
         folders = []
         pageNumber = 1
+        
         while True:
-            # [修改] params 中必须包含 accessCode
-            response = self.session.get("https://cloud.189.cn/api/open/share/listShareDir.action", params={
+            # 使用原始 shareCode 构造 Referer
+            referer_code = getattr(self, 'shareCode', None) or self.shareId
+            
+            custom_headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Accept": "application/json;charset=UTF-8",
+                "Referer": f"https://cloud.189.cn/web/share.html?code={referer_code}",
+                "Origin": "https://cloud.189.cn",
+                "Host": "cloud.189.cn"
+            }
+
+            params = {
                 "pageNum": pageNumber,
                 "pageSize": "10000",
                 "fileId": folder_id,
                 "shareDirFileId": self.shareDirFileId,
                 "isFolder": "true",
                 "shareId": self.shareId,
-                "shareMode": self.shareMode,
                 "iconOption": "5",
                 "orderBy": "lastOpTime",
                 "descending": "true",
-                "accessCode": self.accessCode, # [关键] 这里必须传访问码，否则报错
-            })
+                "accessCode": self.accessCode
+            }
+            
+            if self.shareMode is not None:
+                params["shareMode"] = self.shareMode
+
+            response = self.session.get(
+                "https://cloud.189.cn/api/open/share/listShareDir.action", 
+                headers=custom_headers, 
+                params=params
+            )
+            
             result = self.client._parse_json(response)
             
-            # === [新增] 调试代码：打印异常的响应内容 ===
+            # 自动重试机制
+            if result.get('res_code') != 0 and "shareMode" in params:
+                del params["shareMode"]
+                response = self.session.get(
+                    "https://cloud.189.cn/api/open/share/listShareDir.action", 
+                    headers=custom_headers, 
+                    params=params
+                )
+                result = self.client._parse_json(response)
+
             if result.get('res_code') is None:
                 log.error(f"🛑【调试信息】API响应异常，完整内容: {result}")
-            # ========================================
             
             if result.get('res_code') != 0:
-                # 打印更详细的错误日志
                 error_msg = result.get('res_message', 'Unknown Error')
+                log.error(f"获取文件列表失败: {error_msg}")
             
             if not isinstance(result.get("fileListAO"), dict):
                 error_info = f"Invalid fileListAO format: {result}"
                 log.error(error_info)
-                # === [修改] 遇到严重错误直接抛出异常，通知上层任务失败 ===
                 raise Exception(error_info) 
             
             fileListAO = result["fileListAO"]
@@ -291,7 +321,6 @@ class Cloud189ShareInfo:
             current_files = fileListAO.get("fileList", [])
             current_folders = fileListAO.get("folderList", [])
             
-            # 如果文件和文件夹都为空，可能是空目录或读取结束
             if fileListAO.get("fileListSize", 0) == 0 and len(current_folders) == 0:
                 break
             
@@ -299,9 +328,7 @@ class Cloud189ShareInfo:
             folders += current_folders
             pageNumber += 1
             
-            # 简单的防死循环
             if pageNumber > 1000:
-                log.warning("页数过多，强制停止")
                 break
                 
         return {"files": fileList, "folders": folders}
@@ -783,16 +810,13 @@ class Cloud189:
         return all_files
 
 
-# [修改后 V2] 修复部分链接不返回 shareId 导致的报错
     def getShareInfo(self, link):
         url = parse.urlparse(link)
         query_params = parse.parse_qs(url.query)
         
-        # 1. 提取 URL 中的 accessCode
         access_code = query_params.get('accessCode', [''])[0]
 
         try:
-            # 2. 提取 shareCode (例如 UzmqYvvANn6r)
             if "code" in query_params:
                 code = query_params["code"][0]
             else:
@@ -804,35 +828,75 @@ class Cloud189:
         except (KeyError, IndexError):
              raise Exception("无法从分享链接中提取分享码")
         
-        # 3. 构造请求参数
+        # 定义变量存储真实的数字 shareId
+        numeric_share_id = None
+
+        # === 1. 优先通过验证接口获取 numeric_share_id ===
+        if access_code:
+            try:
+                check_url = "https://cloud.189.cn/api/open/share/checkAccessCode.action"
+                check_headers = {
+                    "User-Agent": PC_USER_AGENT,
+                    "Referer": f"https://cloud.189.cn/web/share.html?code={code}",
+                    "Host": "cloud.189.cn"
+                }
+                check_params = {
+                    "shareCode": code,
+                    "accessCode": access_code
+                }
+                
+                check_res = self.session.get(check_url, params=check_params, headers=check_headers)
+                check_data = self._parse_json(check_res)
+                
+                # [核心修复] 从验证结果中提取 shareId
+                # 成功时通常返回: {"res_code": 0, "shareId": 123456789, ...}
+                if check_data.get("res_code") == 0 and "shareId" in check_data:
+                    numeric_share_id = check_data["shareId"]
+                    log.info(f"访问码验证成功，获取到数字 shareId: {numeric_share_id}")
+                else:
+                    log.warning(f"访问码验证未返回 shareId: {check_data}")
+                    
+            except Exception as e:
+                log.warning(f"访问码验证请求异常: {e}")
+
+        # === 2. 获取详细信息 ===
         api_params = {
             "shareCode": code
         }
         if access_code:
             api_params["accessCode"] = access_code
 
-        # 4. 发起请求
         response = self.session.get("https://cloud.189.cn/api/open/share/getShareInfoByCodeV2.action", params=api_params)
         result = self._parse_json(response)
 
-        # 5. 错误处理
         if result.get('res_code') != 0:
             raise Exception(f"获取分享信息失败: {result.get('res_message', '未知错误')} (Code: {result.get('res_code')})")
 
-        real_share_id = result.get("shareId", code)
+        # 优先使用 checkAccessCode 返回的 id，其次用 info 返回的，最后才兜底用 code (但这步会导致 InternalError)
+        real_share_id = numeric_share_id if numeric_share_id else result.get("shareId", code)
+        
         real_file_id = result.get("fileId")
         real_share_mode = result.get("shareMode", 1)
+        real_share_name = result.get("fileName", "天翼分享")
 
         if not real_file_id:
-             raise Exception(f"API返回数据异常，未找到文件ID(fileId)。API响应: {result}")
+             # 尝试容错：如果是文件分享，可能 info 里没有 fileId
+             # 但对于文件夹转存，没有 fileId 是致命的
+             if "fileListAO" in result and result["fileListAO"].get("fileList"):
+                 # 这是一个纯文件分享，根目录可能是虚拟的
+                 real_file_id = 0 # 或者其他标识
+             else:
+                 pass 
+                 # raise Exception(f"API返回数据异常，未找到文件ID(fileId)。API响应: {result}")
             
-        # 6. 返回对象
         return Cloud189ShareInfo(
-            shareId=real_share_id,
+            shareId=real_share_id, # 这里必须是数字！
             shareDirFileId=real_file_id,
             cloud189Client=self,
             shareMode=real_share_mode,
-            accessCode=access_code 
+            accessCode=access_code,
+            shareName=real_share_name,
+            shareCode=code # 这里是字符串
         )
 
     def createFolderFromShareLink(self, link, parentFolderId):
@@ -940,6 +1004,62 @@ def save_189_link(client : Cloud189, link, parentFolderId):
             log.error(final_msg)
             notifier.send_message(final_msg)
             return False
+        
+# === [新增] 递归获取分享链接中的所有文件信息（只读不存） ===
+def get_share_file_snapshot(client: Cloud189, link):
+    """
+    递归提取分享链接中的所有文件元数据(MD5, Size, Name)
+    返回: (file_list, root_folder_name)
+    """
+    try:
+        # 1. 获取分享基本信息
+        share_info = client.getShareInfo(link)
+        # [新增] 获取根目录名
+        root_folder_name = share_info.shareName 
+        
+        all_files = []
+        # 待扫描的文件夹队列 (folder_id, relative_path)
+        # 根目录 folder_id 使用 shareInfo 中的 shareDirFileId
+        queue = [(share_info.shareDirFileId, "/")]
+        
+        # 限制扫描数量防止超时
+        max_scan_folders = 200
+        scanned_count = 0
+        
+        while queue:
+            if scanned_count > max_scan_folders:
+                logger.warning(f"分享链接文件夹过多(>{max_scan_folders})，停止扫描")
+                break
+                
+            curr_id, curr_path = queue.pop(0)
+            scanned_count += 1
+            
+            # 获取当前目录内容
+            data = share_info.getAllShareFiles(curr_id)
+            
+            # 处理文件
+            for f in data.get('files', []):
+                # 必须有MD5
+                if f.get('md5'):
+                    all_files.append({
+                        "name": f.get('name'),
+                        "size": int(f.get('size', 0)),
+                        "md5": f.get('md5').lower(),
+                        "path": curr_path + f.get('name') # 完整相对路径
+                    })
+            
+            # 处理文件夹 (加入队列继续扫描)
+            for d in data.get('folders', []):
+                sub_path = curr_path + d.get('name') + "/"
+                queue.append((d.get('id'), sub_path))
+                
+            time.sleep(0.1) # 避免请求过快
+            
+        return all_files, root_folder_name
+        
+    except Exception as e:
+        logger.error(f"提取分享快照失败: {e}")
+        return None, None      
 
 def init_database():
     conn = sqlite3.connect(DATABASE_FILE)
