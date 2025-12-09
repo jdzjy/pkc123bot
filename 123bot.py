@@ -41,7 +41,7 @@ logging.getLogger("httpx").setLevel(logging.ERROR)
 logging.getLogger("urllib3.connectionpool").setLevel(logging.ERROR)
 logging.getLogger("telebot").setLevel(logging.ERROR)
 
-version = "8.0.3"  
+version = "8.0.4"  
 newest_id = 50
 # 加载.env文件中的环境变量
 load_dotenv(dotenv_path="db/user.env",override=True)
@@ -159,6 +159,10 @@ FILTER = os.getenv("ENV_FILTER", "")
 filter_pattern = re.compile(FILTER, re.IGNORECASE)
 #需要转存的123目录ID
 UPLOAD_TARGET_PID = get_int_env("ENV_123_UPLOAD_PID", 0)
+# 获取需要过滤的后缀名，默认为空，多个用逗号分隔
+ENV_EXT_FILTER = os.getenv("ENV_EXT_FILTER", "")
+# 预处理为小写列表，例如 ['.nfo', '.jpg', '.png']
+SKIP_EXTENSIONS = [ext.strip().lower() for ext in ENV_EXT_FILTER.split(',') if ext.strip()]
 
 UPLOAD_JSON_TARGET_PID = get_int_env("ENV_123_JSON_UPLOAD_PID", 0)
 UPLOAD_LINK_TARGET_PID = get_int_env("ENV_123_LINK_UPLOAD_PID", UPLOAD_JSON_TARGET_PID)
@@ -209,6 +213,22 @@ if TOKENSHARE:
 from share import get_quality
 import re
 from urllib.parse import urlparse, parse_qs
+
+def check_ext_filter(filename):
+    """
+    检查文件后缀是否在黑名单中
+    返回 True 表示需要跳过，False 表示允许处理
+    """
+    if not SKIP_EXTENSIONS or not filename:
+        return False
+    
+    # 获取文件后缀（转小写）
+    _, ext = os.path.splitext(filename)
+    ext = ext.lower()
+    
+    if ext in SKIP_EXTENSIONS:
+        return True
+    return False
 
 def parse_share_url(share_url):
     """解析分享链接，提取ShareKey和提取码"""
@@ -857,8 +877,14 @@ def transfer_shared_link_optimize(client: P123Client, target_url: str, UPLOAD_TA
         logger.error(f"获取资源结构失败: {str(e)}")
         return False
     
-    fileList = [
-        {
+    fileList = []
+    for item in all_items:
+        # 如果是文件且后缀在黑名单中，则跳过
+        if item["Type"] != 1 and check_ext_filter(item["name"]):
+            logger.info(f"🚫 根据配置跳过文件: {item['name']}")
+            continue
+            
+        fileList.append({
             "fileID": item["file_id"],
             "size": item["size"],
             "etag": item["etag"],
@@ -866,9 +892,14 @@ def transfer_shared_link_optimize(client: P123Client, target_url: str, UPLOAD_TA
             "parentFileID": UPLOAD_TARGET_PID,
             "fileName": item["name"],
             "driveID": 0
-        } for item in all_items
-    ]
+        })
+
+    if not fileList:
+        logger.warning("过滤后没有文件需要转存")
+        return False
+
     logger.info(f"准备转存文件列表到目录: {UPLOAD_TARGET_PID}")
+
     try:
         # 保持原生 requests 调用，这是最稳妥的批量转存方式
         url = "https://www.123pan.com/b/api/restful/goapi/v1/file/copy/save"
@@ -2157,6 +2188,12 @@ def parse_share_link(message, share_link, up_load_pid=UPLOAD_JSON_TARGET_PID, se
         
         if is_common_path_format and common_base_path:
             file_path = common_base_path + file_path
+
+        # 注意：这里 file_path 可能是完整路径 "folder/file.jpg"
+        if check_ext_filter(file_path):
+             # 可以在这里记录日志，但为了避免刷屏，可以选择不记录或debug记录
+             continue 
+        # =========================
             
         files.append({
             "etag": etag,
@@ -2165,7 +2202,7 @@ def parse_share_link(message, share_link, up_load_pid=UPLOAD_JSON_TARGET_PID, se
             "is_v2_etag": is_v2_etag_format
         })
     
-    logger.info(f"解析完成: 共 {len(files)} 个文件")
+    logger.info(f"解析完成: 共 {len(files)} 个文件 (已过滤后缀)")
     
     if not files:
         return False
@@ -2616,7 +2653,12 @@ def get_progress_bar(current, total, length=15):
 def sync_file_worker(client123, file_info, root_123_pid, folder_cache):
     """
     [子线程工作函数] 处理单个文件的目录检查与秒传
-    """
+    """   
+    # 增加前置检查
+    if check_ext_filter(file_info['file_name']):
+        # 返回一个特殊的跳过状态，或者直接当做成功但不处理
+        # 这里建议返回 fail 或新增 skipped 状态，这里简单返回 skipped
+        return {"status": "skipped", "name": file_info['file_name'], "msg": "后缀过滤"}     
     try:
         # === 1. 目录结构处理 (必须加锁) ===
         relative_path = file_info.get('parent_path', '/').strip('/')
@@ -2721,7 +2763,7 @@ def process_189_to_123_sync(message):
         return
 
     total_files = len(files_189)
-    bot.edit_message_text(f"📊 扫描到 {total_files} 个文件，准备启动 5 线程并发秒传...", chat_id=status_msg.chat.id, message_id=status_msg.message_id)
+    bot.edit_message_text(f"🔍 扫描到 {total_files} 个文件，准备启动 5 线程并发秒传...", chat_id=status_msg.chat.id, message_id=status_msg.message_id)
 
     # --- 3. 初始化 123 客户端 & 准备工作 ---
     client123 = init_123_client()
@@ -2815,7 +2857,7 @@ def process_189_to_123_sync(message):
     # --- 6. 最终战报 ---
     total_time = int(time.time() - start_time)
     result_msg = (
-        f"🏁 **189 -> 123 同步任务结束**\n\n"
+        f"🏁 **189⚡123 同步任务结束**\n\n"
         f"⏱️ 耗时: {total_time} 秒\n"
         f"📂 总文件: {total_files}\n"
         f"✅ 秒传成功: {success_count}\n"
@@ -3488,10 +3530,11 @@ def handle_general_message(message):
         reply_thread_pool.submit(send_reply, message, "未识别的命令")
 
 
-# [修改] 启动人形监听线程 (升级：-s123回复支持TMDB富文本+海报缩略图)
+#  启动人形监听线程 (升级：-s123回复支持TMDB富文本+海报缩略图)
+# [修改] 启动人形监听线程 (升级：支持后缀过滤 + TMDB富文本 + 海报缩略图)
 def start_userbot_listener():
     """
-    启动 Pyrogram Userbot 监听人形命令 (修复版 V3：媒体组深层扫描 + 消息回溯删除)
+    启动 Pyrogram Userbot 监听人形命令 (修复版 V4：增加后缀过滤)
     """
     import traceback
     import time
@@ -3666,14 +3709,11 @@ def start_userbot_listener():
                 logger.error(f"Userbot -s123 error: {e}")
                 await message.edit_text(f"❌ 搜索出错: {e}")
 
-        # ---------------- 序号选择 (修复：消息回溯删除) ----------------
+        # ---------------- 序号选择 (修复：消息回溯删除 + 文件过滤) ----------------
         @app.on_message(filters.me & filters.regex(r"^\d+(\s+\d+)*$"))
         async def userbot_selection_handler(client, message):
-            # [修复] 安全获取文本，防止 NoneType 报错
             raw_text = message.text or message.caption or ""
-            if not raw_text:
-                # 如果没有文本，直接忽略，不处理
-                return
+            if not raw_text: return
 
             text = message.text.strip()
             
@@ -3691,14 +3731,12 @@ def start_userbot_listener():
             if message.reply_to_message:
                 list_msg = message.reply_to_message
             else:
-                # [修复] 无引用时，通过 ID 强行抓取消息对象
                 try:
                     loaded_data = json.loads(data)
                     saved_msg_id = loaded_data.get("msg_id")
                     saved_chat_id = loaded_data.get("chat_id")
                     
                     if saved_chat_id == message.chat.id and saved_msg_id:
-                        # 使用 get_messages 获取单条消息
                         list_msg = await client.get_messages(message.chat.id, saved_msg_id)
                 except Exception as e:
                     logger.warning(f"回溯消息失败: {e}")
@@ -3732,8 +3770,29 @@ def start_userbot_listener():
                     folder_name = selected_item['name']
 
                     try:
+                        # 获取全部文件列表
                         files = await loop.run_in_executor(None, get_directory_files, p123, file_id, folder_name)
                         if not files: continue
+
+                        # === [新增] 这里执行后缀过滤 ===
+                        filtered_files = []
+                        skipped_num = 0
+                        for f in files:
+                            # 调用全局定义的 check_ext_filter
+                            if check_ext_filter(f.get("path", "")):
+                                skipped_num += 1
+                                continue
+                            filtered_files.append(f)
+                        
+                        files = filtered_files
+                        
+                        if skipped_num > 0:
+                            logger.info(f"Userbot生成JSON: 已过滤 {skipped_num} 个文件")
+                            
+                        if not files:
+                            await client.send_message(message.chat.id, f"❌ 文件夹 {folder_name} 内所有文件均被过滤规则屏蔽")
+                            continue
+                        # ==============================
 
                         video_exts = {'.mkv', '.mp4', '.avi', '.mov', '.ts', '.rmvb', '.iso', '.wmv', '.m2ts', '.mpg', '.flv', '.rm'}
                         video_files = [f for f in files if os.path.splitext(f["path"])[1].lower() in video_exts]
@@ -3823,7 +3882,7 @@ def start_userbot_listener():
             except Exception as e:
                 logger.error(f"Userbot 选择处理出错: {e}")
 
-        # ---------------- mc 命令 (修复：媒体组深层扫描 + 纯文本JSON) ----------------
+        # ---------------- mc 命令 (修复：媒体组深层扫描 + 纯文本JSON + 后缀过滤) ----------------
         @app.on_message(filters.me & filters.command("mc", prefixes="-"))
         async def userbot_mc_handler(client, message):
             target_msg = message.reply_to_message or message
@@ -3850,7 +3909,6 @@ def start_userbot_listener():
                 json_data = None
                 doc = None
 
-                # JSON 判定
                 def is_json_doc(msg_obj):
                     if not msg_obj or not msg_obj.document: return False
                     fname = (msg_obj.document.file_name or "").lower()
@@ -3858,26 +3916,20 @@ def start_userbot_listener():
                     if fname.endswith(".json") or "json" in mime: return True
                     return False
 
-                # 1. 检查当前回复的消息
                 if is_json_doc(target_msg):
                     doc = target_msg.document
                 
-                # 2. [关键修复] 检查媒体组 (Media Group)
-                # 即使回复的是图片，也要把同组的JSON找出来
                 if not doc and target_msg.media_group_id:
                     try:
-                        # get_media_group 返回的是同组的所有消息列表
                         media_group = await client.get_media_group(target_msg.chat.id, target_msg.id)
                         if media_group:
                             for m in media_group:
                                 if is_json_doc(m):
                                     doc = m.document
-                                    # logger.info(f"在媒体组中找到 JSON: {doc.file_name}")
                                     break
                     except Exception as e:
                         logger.warning(f"获取媒体组失败: {e}")
 
-                # A. 处理文件 JSON
                 if doc:
                     await status_msg.edit_text(f"📥 正在下载: {doc.file_name}...")
                     file_path = await client.download_media(doc)
@@ -3885,7 +3937,6 @@ def start_userbot_listener():
                         json_data = json.load(f)
                     os.remove(file_path)
                 
-                # B. 处理纯文本 JSON
                 elif target_msg.text or target_msg.caption:
                     text_content = target_msg.text or target_msg.caption
                     stripped = text_content.strip()
@@ -3896,10 +3947,10 @@ def start_userbot_listener():
                             await status_msg.edit_text("📥 识别到文本JSON，正在解析...")
                         except: pass
 
-                # 执行 JSON 转存
                 if json_data:
                     await status_msg.edit_text("⚙️ 正在转存 (请稍候)...")
                     with link_process_lock:
+                        # 核心函数 core_process_json_data 内部已经集成了过滤逻辑
                         transfer_result = await loop.run_in_executor(None, core_process_json_data, json_data, ub_log_callback)
                     
                     if transfer_result:
@@ -3910,6 +3961,7 @@ def start_userbot_listener():
                         fail_count = transfer_result.get('fail_count', 0)
                         file_list = transfer_result.get('file_list', [])
                         total_size_str = transfer_result.get('total_size_str', '0B')
+                        filtered_count = transfer_result.get('filtered_count', 0) # 获取过滤数
                         
                         video_exts = {'.mkv', '.mp4', '.avi', '.mov', '.ts', '.rmvb', '.iso', '.wmv', '.m2ts', '.mpg', '.flv', '.rm'}
                         video_files = [f for f in file_list if os.path.splitext(f)[1].lower() in video_exts]
@@ -3922,6 +3974,8 @@ def start_userbot_listener():
                         poster_path = None
                         caption = ""
                         
+                        filter_msg = f"🚫 过滤: {filtered_count}\n" if filtered_count > 0 else ""
+
                         if tmdb_info:
                             if tmdb_info.get('poster_path'):
                                 try:
@@ -3944,6 +3998,7 @@ def start_userbot_listener():
                                 f"\n📖 简介: <blockquote expandable=\"\">{metadata.get('plot')[:100]}...</blockquote>\n\n"
                                 f"📂 目录: {folder_name}\n"
                                 f"📊 状态: 成功 {success_count} / 失败 {fail_count}\n"
+                                f"{filter_msg}"
                                 f"📦 体积: {total_size_str} \n"
                                 f"🖼️ 质量: {quality}\n"
                                 f"🦋 完整性: {analysis_report}\n\n"
@@ -3954,6 +4009,7 @@ def start_userbot_listener():
                                 f"📂 <b>{folder_name}</b>\n\n"
                                 f"⚠️ 未找到 TMDB 信息 (关键词: {clean_keyword})\n"
                                 f"📊 状态: 成功 {success_count} / 失败 {fail_count}\n"
+                                f"{filter_msg}"
                                 f"📦 体积: {total_size_str} \n"
                                 f"🖼️ 质量: {quality}\n"
                                 f"🙋 来自🤖转存完成"
@@ -3983,6 +4039,7 @@ def start_userbot_listener():
                             with link_process_lock:
                                 for link in links:
                                     try:
+                                        # parse_share_link 内部也已经集成了过滤逻辑
                                         parse_share_link(None, link, send_messages=False)
                                         res_list.append(f"✅ 已提交: {link[:15]}...")
                                     except Exception as e:
@@ -4070,13 +4127,10 @@ def get_existing_shares(client: P123Client, folder_name: str) -> dict:
 
 def core_process_json_data(json_data, log_callback):
     """
-    执行 JSON 转存的核心逻辑
-    :param json_data: 解析后的 JSON 对象 (dict 或 list)
-    :param log_callback: 用于回传日志消息的回调函数，接收一个字符串参数
-    :return: dict 包含转存统计和文件列表，用于后续分析；如果失败返回 None
+    执行 JSON 转存的核心逻辑 (修复除以零错误版)
     """
     try:
-        # 判断并转换不同的JSON格式
+        # 1. 解析 JSON 数据
         if isinstance(json_data, list):
             # 格式2: 数组格式 [[etag, size, filename], ...]
             logger.info("检测到数组格式的妙传文件")
@@ -4094,8 +4148,6 @@ def core_process_json_data(json_data, log_callback):
                         'size': size
                     })
                     total_size_json += int(size)
-            
-            total_files_count = len(files)
         else:
             # 格式1: 对象格式 {commonPath, files, ...}
             logger.info("检测到对象格式的妙传文件")
@@ -4104,74 +4156,73 @@ def core_process_json_data(json_data, log_callback):
                 common_path = common_path[:-1]
             files = json_data.get('files', [])
             uses_v2_etag = json_data.get('usesBase62EtagsInExport', False)
-            total_files_count = json_data.get('totalFilesCount', len(files))
             total_size_json = json_data.get('totalSize', 0)
 
+        # 2. 过滤文件逻辑
+        filtered_files = []
+        skipped_count_by_ext = 0
+        
+        for file_info in files:
+            f_path = file_info.get('path', '')
+            if check_ext_filter(f_path):
+                skipped_count_by_ext += 1
+                continue
+            filtered_files.append(file_info)
+        
+        files = filtered_files
+        
+        if skipped_count_by_ext > 0:
+            log_callback(f"🚫 根据配置过滤了 {skipped_count_by_ext} 个不需要的文件")
+
         if not files:
-            log_callback("JSON文件中没有找到文件信息。")
+            log_callback("JSON文件中没有找到有效文件（或全部被过滤）。")
             return None
 
-        log_callback(f"开始转存JSON文件中的{len(files)}个文件...")
+        # 3. 准备工作
+        total_files_count = len(files) # 锁定总数，防止变化
+        log_callback(f"开始转存JSON文件中的 {total_files_count} 个文件...")
         start_time = time.time()
         
-        # 初始化123客户端
         client = init_123_client()
-
-        # 转存文件
         results = []
-        message_batch = []  # 用于存储每批消息
-        batch_size = 0      # 批次大小计数器
-        total_size = 0      # 累计成功转存文件体积(字节)
-        skip_count = 0      # 跳过的重复文件数量
-        last_etag = None    # 上一个成功转存文件的etag
-        
-        # 用于存储成功转存的文件名(含重复跳过的)，供分析使用
+        message_batch = []
+        batch_size = 0
+        total_size = 0
+        skip_count = 0
+        last_etag = None
         success_filenames = [] 
-
-        # 创建文件夹缓存
         folder_cache = {}
         target_dir_name = common_path if common_path else 'JSON转存'
-        # 使用UPLOAD_JSON_TARGET_PID作为根目录
         target_dir_id = UPLOAD_JSON_TARGET_PID
 
+        # 4. 遍历转存
         for i, file_info in enumerate(files):
             file_path = file_info.get('path', '')
-            
-            # 构建完整文件路径
             if common_path:
                 file_path = f"{common_path}/{file_path}"
             etag = file_info.get('etag', '')
             size = int(file_info.get('size', 0))
 
             if not all([file_path, etag, size]):
-                results.append({
-                    "success": False,
-                    "file_name": file_path or "未知文件",
-                    "error": "文件信息不完整"
-                })
+                results.append({"success": False, "file_name": file_path, "error": "信息不全"})
                 continue
 
             try:
-                # 处理文件路径
+                # 4.1 创建目录
                 path_parts = file_path.split('/')
                 file_name = path_parts.pop()
                 parent_id = target_dir_id
-
-                # 创建目录结构
                 current_path = ""
+                
                 for part in path_parts:
-                    if not part:
-                        continue
-
+                    if not part: continue
                     current_path = f"{current_path}/{part}" if current_path else part
                     cache_key = f"{parent_id}/{current_path}"
 
-                    # 检查缓存
                     if cache_key in folder_cache:
                         parent_id = folder_cache[cache_key]
                         continue
 
-                    # 创建新文件夹（带重试）
                     retry_count = 3
                     folder = None
                     while retry_count > 0:
@@ -4180,33 +4231,27 @@ def core_process_json_data(json_data, log_callback):
                             time.sleep(0.2)                  
                             check_response(folder)
                             break
-                        except Exception as e:
+                        except Exception:
                             retry_count -= 1
-                            logger.warning(f"创建文件夹 {part} 失败 (剩余重试: {retry_count}): {str(e)}")
-                            time.sleep(31)
+                            time.sleep(3)
 
-                    if not folder:
-                        logger.warning(f"创建文件夹失败: {part}，将使用当前目录")
-                    else:
+                    if folder:
                         folder_id = folder["data"]["Info"]["FileId"]
                         folder_cache[cache_key] = folder_id
                         parent_id = folder_id
-                    
-                # 处理ETag
+                
+                # 4.2 处理ETag
                 if uses_v2_etag:
                     etag = optimized_etag_to_hex(etag, True)
 
-                # 秒传文件（带重试）
+                # 4.3 执行秒传
                 retry_count = 3
                 rapid_resp = None
                 while retry_count > 0:
-                    # 检查etag是否与上一个成功转存的文件相同
                     if last_etag == etag:
                         skip_count += 1
-                        logger.info(f"跳过重复文件: {file_path}")
-                        rapid_resp = {"data": {"Reuse": True, "Skip": True}, "code": 0}  # 标记为跳过
+                        rapid_resp = {"data": {"Reuse": True, "Skip": True}, "code": 0}
                         break
-                    
                     try:
                         rapid_resp = client.upload_file_fast(
                             file_name=file_name,
@@ -4217,84 +4262,91 @@ def core_process_json_data(json_data, log_callback):
                         )
                         check_response(rapid_resp)
                         break
-                    except Exception as e:
+                    except Exception:
                         retry_count -= 1
-                        logger.warning(f"转存文件 {file_name} 失败 (剩余重试: {retry_count}): {str(e)}")
-                        if rapid_resp and ("Etag" in rapid_resp.get("message", {})):
-                            break                            
-                        time.sleep(31)
+                        time.sleep(3)
 
+                # 4.4 记录结果
+                dir_p = os.path.dirname(file_path)
+                
                 if rapid_resp is None:
-                    error_msg = "秒传失败：接口返回空值且重试耗尽"
-                    results.append({"success": False, "file_name": file_path, "error": error_msg})
-                    msg = {'status': '❌', 'dir': os.path.dirname(file_path), 'file': f"{file_name} ({error_msg})"}
-                    message_batch.append(msg)
-                    batch_size += 1
+                    err = "请求重试耗尽"
+                    results.append({"success": False, "file_name": file_path, "error": err})
+                    message_batch.append({'status': '❌', 'dir': dir_p, 'file': f"{file_name} ({err})"})
                     
-                elif rapid_resp.get("code") == 0 and rapid_resp.get("data", {}) and rapid_resp.get("data", {}).get("Reuse", False):
+                elif rapid_resp.get("code") == 0 and rapid_resp.get("data", {}).get("Reuse", False):
                     if rapid_resp.get("data", {}).get("Skip"):
-                        msg = {'status': '🔄', 'dir': os.path.dirname(file_path), 'file': f"{file_name} (重复跳过)"}
-                        message_batch.append(msg)
-                        batch_size += 1
+                        message_batch.append({'status': '🔄', 'dir': dir_p, 'file': f"{file_name} (重复)"})
                         success_filenames.append(file_name) 
                     else:
                         last_etag = etag
                         results.append({"success": True, "file_name": file_path, "size": size})
                         total_size += size
-                        msg = {'status': '✅', 'dir': os.path.dirname(file_path), 'file': file_name}
-                        message_batch.append(msg)
-                        batch_size += 1
+                        message_batch.append({'status': '✅', 'dir': dir_p, 'file': file_name})
                         success_filenames.append(file_name) 
                 else:
-                    error_msg = "此文件在123服务器不存在，无法秒传" if rapid_resp.get("data", {}) and (rapid_resp.get("data", {}).get("Reuse", True) == False) else rapid_resp.get("message", "未知错误")
-                    results.append({"success": False, "file_name": file_path, "error": error_msg})
-                    msg = {'status': '❌', 'dir': os.path.dirname(file_path), 'file': f"{file_name} ({error_msg})"}
-                    message_batch.append(msg)
-                    batch_size += 1
+                    err = "无法秒传"
+                    results.append({"success": False, "file_name": file_path, "error": err})
+                    message_batch.append({'status': '❌', 'dir': dir_p, 'file': f"{file_name} ({err})"})
+                
+                batch_size += 1
 
-                # 批次日志发送
+                # 4.5 [关键修复] 安全的日志计算
                 if batch_size % 10 == 0:
                     tree_messages = defaultdict(lambda: {'✅': [], '❌': [], '🔄': []})
                     for entry in message_batch:
                         tree_messages[entry['dir']][entry['status']].append(entry['file'])
                     
                     batch_msg = []
-                    for dir_path, status_files in tree_messages.items():
-                        for status, files in status_files.items():
-                            if files:
-                                batch_msg.append(f"--- {status} {dir_path}")
-                                for i, file in enumerate(files):
-                                    prefix = '      └──' if i == len(files)-1 else '      ├──'
-                                    batch_msg.append(f"{prefix} {file}")
-                    batch_msg = "\n".join(batch_msg)
-                    log_callback(f"📊 {batch_size}/{total_files_count} ({int(batch_size/total_files_count*100)}%) 个文件已处理\n\n{batch_msg}")
+                    for d, s_files in tree_messages.items():
+                        for s, fs in s_files.items():
+                            if fs:
+                                batch_msg.append(f"--- {s} {d}")
+                                for idx, f in enumerate(fs):
+                                    prefix = '      └──' if idx == len(fs)-1 else '      ├──'
+                                    batch_msg.append(f"{prefix} {f}")
+                    batch_msg_str = "\n".join(batch_msg)
+                    
+                    # 修复点1：防止 total_files_count 为 0
+                    if total_files_count > 0:
+                        percent = int(batch_size / total_files_count * 100)
+                    else:
+                        percent = 0
+                        
+                    log_callback(f"📊 {batch_size}/{total_files_count} ({percent}%) 个文件已处理\n\n{batch_msg_str}")
                     message_batch = []
                 
-                time.sleep(1/get_int_env("ENV_FILE_PER_SECOND", 5))
+                # 4.6 [关键修复] 安全的速率休眠
+                # 防止 ENV_FILE_PER_SECOND 为 0 导致 crash
+                rate_limit = get_int_env("ENV_FILE_PER_SECOND", 5)
+                if rate_limit > 0:
+                    time.sleep(1.0 / rate_limit)
 
             except Exception as e:
-                msg = {'status': '❌', 'dir': os.path.dirname(file_path), 'file': f"{file_name} ({str(e)})"}
-                message_batch.append(msg)
+                # 捕获单个文件处理中的所有异常，防止打断整个任务
+                err_str = str(e)
+                logger.error(f"处理文件出错 {file_name}: {err_str}")
+                results.append({"success": False, "file_name": file_path, "error": err_str})
+                message_batch.append({'status': '❌', 'dir': os.path.dirname(file_path), 'file': f"{file_name} ({err_str})"})
                 batch_size += 1
-                results.append({"success": False, "file_name": file_path, "error": str(e)})
 
-        # 处理剩余消息
+        # 5. 处理剩余消息
         if message_batch:
             tree_messages = defaultdict(lambda: {'✅': [], '❌': [], '🔄': []})
             for entry in message_batch:
                 tree_messages[entry['dir']][entry['status']].append(entry['file'])
             batch_msg = []
-            for dir_path, status_files in tree_messages.items():
-                for status, files in status_files.items():
-                    if files:
-                        batch_msg.append(f"--- {status} {dir_path}")
-                        for i, file in enumerate(files):
-                            prefix = '      └──' if i == len(files)-1 else '      ├──'
-                            batch_msg.append(f"{prefix} {file}")
-            batch_msg = "\n".join(batch_msg)
-            log_callback(f"📊 {batch_size}/{total_files_count} (100%) 个文件已处理\n\n{batch_msg}")
+            for d, s_files in tree_messages.items():
+                for s, fs in s_files.items():
+                    if fs:
+                        batch_msg.append(f"--- {s} {d}")
+                        for idx, f in enumerate(fs):
+                            prefix = '      └──' if idx == len(fs)-1 else '      ├──'
+                            batch_msg.append(f"{prefix} {f}")
+            batch_msg_str = "\n".join(batch_msg)
+            log_callback(f"📊 {batch_size}/{total_files_count} (100%) 个文件已处理\n\n{batch_msg_str}")
 
-        # 统计结果
+        # 6. 统计结果
         end_time = time.time()
         elapsed_time = end_time - start_time
         hours, remainder = divmod(int(elapsed_time), 3600)
@@ -4303,40 +4355,38 @@ def core_process_json_data(json_data, log_callback):
 
         success_count = sum(1 for r in results if r.get('success'))
         fail_count = len(results) - success_count
-        
-        # 格式化大小
         size_str = get_formatted_size(total_size)
-        avg_size = total_size / success_count if success_count > 0 else 0
-        avg_size_str = get_formatted_size(avg_size)
 
-        result_msg = f"✅ JSON文件转存完成！\n✅成功: {success_count}个\n❌失败: {fail_count}个\n🔄跳过重复: {skip_count}个\n📊体积: {size_str}\n⏱️耗时: {time_str}"
+        result_msg = (
+            f"✅ JSON文件转存完成！\n"
+            f"✅成功: {success_count}个\n"
+            f"❌失败: {fail_count}个\n"
+            f"🔄跳过重复: {skip_count}个\n"
+            f"🚫后缀过滤: {skipped_count_by_ext}个\n"
+            f"📊体积: {size_str}\n"
+            f"⏱️耗时: {time_str}"
+        )
         log_callback(result_msg)
 
         if fail_count > 0:
-            failed_files = []
-            for result in results:
-                if not result.get("success"):
-                    failed_files.append(f"• {result['file_name']}（{result.get('error')}）")
-            
-            batch_size_err = 10
-            for idx in range(0, len(failed_files), batch_size_err):
-                batch = failed_files[idx:idx+batch_size_err]
+            failed_files = [f"• {r['file_name']}（{r.get('error')}）" for r in results if not r.get("success")]
+            # 分批发送错误日志
+            for idx in range(0, len(failed_files), 10):
+                batch = failed_files[idx:idx+10]
                 batch_msg = "❌ 失败详情:\n" + "\n".join(batch)
                 log_callback(batch_msg)
                 time.sleep(0.5)
         
-        # 构建返回的统计数据
-        summary_data = {
+        return {
             "success_count": success_count,
             "fail_count": fail_count,
             "skip_count": skip_count,
+            "filtered_count": skipped_count_by_ext,
             "total_size_str": size_str,
             "time_str": time_str,
             "target_dir_name": target_dir_name, 
             "file_list": success_filenames     
         }
-        
-        return summary_data
 
     except Exception as e:
         logger.error(f"核心JSON处理异常: {str(e)}")
@@ -4397,10 +4447,16 @@ import threading
 link_process_lock = threading.Lock()
 quark_folder_lock = threading.Lock()
 def process_single_quark_file(client, file_info, common_path, target_dir_id, folder_cache, uses_v2_etag):
-    """
-    [新增] 单个夸克文件处理函数 (用于多线程并发)
-    """
+    """单个夸克文件处理函数 (用于多线程并发)"""
     file_path = file_info.get('path', '')
+    if check_ext_filter(file_path):
+        return {
+            "success": True, # 视为成功以免报错
+            "file_name": file_path, 
+            "size": 0, 
+            "skip": True, # 标记为跳过
+            "msg": "后缀过滤"
+        }    
     
     # 构建完整文件路径
     if common_path:
@@ -4791,7 +4847,7 @@ if __name__ == "__mp_main__":
         logger.info("天翼云盘正在尝试登录 ...")
         client189.login(ENV_189_CLIENT_ID, ENV_189_CLIENT_SECRET)
 
-# === [重写] 全能版天翼云监控 (集成秒传+目录结构+兜底) ===
+# === [重写] 全能版天翼云监控 (集成秒传+目录结构+兜底+优雅战报) ===
 def tg_189monitor(client189):
     # 引用必要组件
     from bot189 import init_database, get_latest_messages, save_message, TelegramNotifier
@@ -4836,6 +4892,43 @@ def tg_189monitor(client189):
             
             all_rapid_success = False
             
+            # [新增] 提前定义统计变量，供后续复用
+            video_count = 0
+            total_size_str = "未知"
+            avg_size_str = "未知"
+            display_msg_url = message_url
+            
+            # [新增] 尝试预先计算统计信息 (如果快照获取成功)
+            if files_in_share:
+                try:
+                    # 1. 过滤后缀 (如果全局定义了check_ext_filter则调用，否则跳过)
+                    filtered_files = []
+                    for f in files_in_share:
+                        if 'check_ext_filter' in globals() and check_ext_filter(f.get('name', '')):
+                            continue
+                        filtered_files.append(f)
+                    files_in_share = filtered_files
+
+                    # 2. 统计数据
+                    video_exts = {'.mkv', '.mp4', '.avi', '.mov', '.ts', '.rmvb', '.iso', '.wmv', '.m2ts', '.mpg', '.flv', '.rm'}
+                    video_files = [f for f in files_in_share if os.path.splitext(f.get('name', ''))[1].lower() in video_exts]
+                    video_count = len(video_files)
+                    total_size_bytes = sum(f.get('size', 0) for f in files_in_share)
+                    
+                    if video_count > 0:
+                        avg_size_bytes = total_size_bytes / video_count
+                    else:
+                        avg_size_bytes = total_size_bytes / len(files_in_share) if files_in_share else 0
+                    
+                    total_size_str = get_formatted_size(total_size_bytes)
+                    avg_size_str = get_formatted_size(avg_size_bytes)
+                    
+                    # 3. 链接修复
+                    if display_msg_url and not display_msg_url.startswith('http'):
+                        display_msg_url = f"https://t.me/{display_msg_url}"
+                except Exception as e:
+                    logger.warning(f"统计信息计算失败: {e}")
+
             if files_in_share:
                 total_f = len(files_in_share)
                 success_f = 0
@@ -4902,12 +4995,16 @@ def tg_189monitor(client189):
                 # 全量成功，流程结束
                 if success_f == total_f and total_f > 0:
                     all_rapid_success = True
-                    status = "转存成功"
+                    status = "✅ 189⚡123云盘极速秒传成功"
+                    # [优化] 极速秒传成功回复
                     result_msg = (
-                        f"✅ 123云盘极速秒传成功！\n"
-                        f"📂 目录: {root_share_name}\n"
-                        f"链接: {target_url}\n"
-                        f"✨ 零流量 | 不占天翼空间"
+                        f"✅ 189⚡123云盘极速秒传成功！\n"
+                        f"📁 名称: {root_share_name}\n"
+                        f"📨 消息: {display_msg_url}\n"
+                        f"🌍 链接: {target_url}\n"
+                        f"🎬 视频: {video_count} 个\n"
+                        f"📦 大小: {total_size_str} | 平均: {avg_size_str}\n"
+                        f"✨ 零流量 · 秒级传输 · 不占空间"
                     )
                     notifier.send_message(result_msg)
                     save_message(message_id, date_str, message_url, target_url, status, result_msg)
@@ -4923,16 +5020,26 @@ def tg_189monitor(client189):
                 
                 if result:
                     status = "转存成功"
+                    # [优化] 兜底转存成功回复
                     result_msg = (
-                        f"✅ 已转存到天翼云盘 (123秒传失败)\n"
-                        f"链接: {target_url}\n"
-                        f"请稍后使用 /sync189 同步"
+                        f"✅ 已转存至天翼云盘 (123秒传未全覆盖)\n"
+                        f"📁 名称: {root_share_name}\n"
+                        f"📨 消息: {display_msg_url}\n"
+                        f"🌍 链接: {target_url}\n"
+                        f"🎬 统计: {video_count} 个视频 (需同步)\n"
+                        f"📦 大小: {total_size_str} | 平均: {avg_size_str}\n"
+                        f"💡 提示: 请稍后使用 /sync189 完成迁移"
                     )
                 else:
                     status = "转存失败"
+                    # [优化] 失败回复
                     result_msg = (
                         f"❌ 天翼云转存失败 (空间不足或其他错误)\n"
-                        f"链接: {target_url}"
+                        f"📁 名称: {root_share_name}\n"
+                        f"📨 消息: {display_msg_url}\n"
+                        f"🌍 链接: {target_url}\n"
+                        f"📦 大小: {total_size_str}\n"
+                        f"🔧 建议: 请检查天翼云空间或Cookie状态"
                     )
                 
                 notifier.send_message(result_msg)
