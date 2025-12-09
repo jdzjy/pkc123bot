@@ -80,11 +80,10 @@ def export_share_info(share_url, cookie=""):
                     
                     # === 核心修复逻辑开始 ===
                     # 优先检查文件列表原始数据中是否已有有效的 MD5
-                    # 夸克大文件的正确 MD5 通常直接在列表中，而不是在下载接口中
                     origin_md5 = file_info.get("md5")
                     
                     if origin_md5 and isinstance(origin_md5, str) and len(origin_md5) == 32:
-                        # 如果已有32位标准MD5，直接使用，不再请求下载接口
+                        # 如果已有32位标准MD5，直接使用
                         file_base["etag"] = origin_md5.lower()
                         json_data["files"].append(file_base)
                     else:
@@ -97,7 +96,7 @@ def export_share_info(share_url, cookie=""):
                 total_found = len(json_data["files"])
                 logger.info(f"--- 初步扫描: {total_found} 个文件已获取MD5，{total_needing} 个文件需进一步请求 --- ")
                 
-                # 3. 仅对缺失MD5的文件批量获取 (通常是极少数或者是小文件)
+                # 3. 仅对缺失MD5的文件批量获取
                 if total_needing > 0:
                     logger.info(f"--- 开始批量获取剩余文件的MD5 (批次大小: {batch_size}) --- ")
                     md5_results = await quark.batch_send_create_share_download_request(
@@ -110,13 +109,15 @@ def export_share_info(share_url, cookie=""):
                     
                     # 4. 处理补充结果
                     for fid, file_base in file_mapping.items():
-                        if fid in md5_results and 'md5' in md5_results[fid]:
+                        # [重点修复] 增加 .get('md5') 的非空判断
+                        # 只有当 md5 存在且不为空字符串时才处理
+                        if fid in md5_results and md5_results[fid].get('md5'):
                             md5_info = md5_results[fid]
-                            # 处理可能存在的 base64 编码情况
                             raw_md5 = md5_info['md5']
                             final_md5 = ""
                             
                             try:
+                                # 处理可能的 Base64 编码
                                 if '==' in raw_md5:    
                                     final_md5 = base64.b64decode(raw_md5).hex()
                                 else:    
@@ -127,9 +128,13 @@ def export_share_info(share_url, cookie=""):
                             file_base["etag"] = final_md5
                             json_data["files"].append(file_base)
                         else:
-                            # 极其罕见情况：无法获取MD5，记录日志并尝试直接加入（虽然转存可能会失败）
-                            logger.warning(f"文件 {file_base['path']} 无法获取MD5")
-                            # file_base["etag"] = "" # 留空或不添加
+                            # 如果 MD5 为空，记录明确的警告日志
+                            # 这些文件如果不包含 etag，秒传肯定会失败，但为了保持文件列表完整性，
+                            # 我们可以选择跳过或者依然加入（但 etag 为空）。
+                            # 这里选择依然加入，但打出警告，方便用户在日志中看到哪些文件出问题了。
+                            logger.warning(f"⚠️ 文件无法获取MD5 (API返回空值): {file_base['path']}")
+                            file_base["etag"] = "" 
+                            json_data["files"].append(file_base)
                             
                 logger.info(f"--- 信息收集完成，共 {len(json_data['files'])} 个文件 ---")
 
