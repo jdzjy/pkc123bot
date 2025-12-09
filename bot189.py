@@ -42,6 +42,10 @@ ENV_189_CLIENT_SECRET = os.getenv("ENV_189_CLIENT_SECRET", "")
 ENV_189_UPLOAD_PID = os.getenv("ENV_189_UPLOAD_PID", "")
 ENV_189_COOKIES = os.getenv("ENV_189_COOKIES", "")
 
+# === 获取过滤配置 ===
+ENV_EXT_FILTER = os.getenv("ENV_EXT_FILTER", "")
+SKIP_EXTENSIONS = [ext.strip().lower() for ext in ENV_EXT_FILTER.split(',') if ext.strip()]
+
 TG_BOT_TOKEN = os.getenv("ENV_TG_BOT_TOKEN", "")
 TG_ADMIN_USER_ID = get_int_env("ENV_TG_ADMIN_USER_ID", 0)
 
@@ -62,6 +66,12 @@ TIMEOUT = 15
 
 # PC User-Agent (用于API交互)
 PC_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
+def is_skipped_file(filename):
+    if not SKIP_EXTENSIONS or not filename:
+        return False
+    _, ext = os.path.splitext(filename)
+    return ext.lower() in SKIP_EXTENSIONS
 
 def rsaEncrpt(password, public_key):
     rsakey = RSA.importKey(public_key)
@@ -1005,7 +1015,7 @@ def save_189_link(client : Cloud189, link, parentFolderId):
             notifier.send_message(final_msg)
             return False
         
-# === [新增] 递归获取分享链接中的所有文件信息（只读不存） ===
+# ===  递归获取分享链接中的所有文件信息（只读不存） ===
 def get_share_file_snapshot(client: Cloud189, link):
     """
     递归提取分享链接中的所有文件元数据(MD5, Size, Name)
@@ -1041,11 +1051,17 @@ def get_share_file_snapshot(client: Cloud189, link):
             for f in data.get('files', []):
                 # 必须有MD5
                 if f.get('md5'):
+                    # === [修改] 增加过滤 ===
+                    fname = f.get('name')
+                    if is_skipped_file(fname):
+                        logger.info(f"🚫 [189] 跳过文件: {fname}")
+                        continue
+                    
                     all_files.append({
-                        "name": f.get('name'),
+                        "name": fname,
                         "size": int(f.get('size', 0)),
                         "md5": f.get('md5').lower(),
-                        "path": curr_path + f.get('name') # 完整相对路径
+                        "path": curr_path + fname # 完整相对路径
                     })
             
             # 处理文件夹 (加入队列继续扫描)
