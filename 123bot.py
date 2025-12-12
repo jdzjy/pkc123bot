@@ -2909,7 +2909,7 @@ def handle_sync_189_command(message):
 
 # ================= [结束] 新增 sync189 逻辑 =================
 
-from quark_export_share import export_share_info
+from quark_export_share import export_share_info, QuarkCookieError
 from share import TMDBHelper
 tmdb = TMDBHelper()
 # 创建锁对象确保文件依次转存
@@ -3015,18 +3015,25 @@ def handle_general_message(message):
             fail_count = 0
             for url in target_urls:
                 try:
-                    json_data = export_share_info(url,os.getenv("ENV_KUAKE_COOKIE", ""))
+                    # 尝试导出，如果 Cookie 失效，这里会抛出 QuarkCookieError
+                    json_data = export_share_info(url, os.getenv("ENV_KUAKE_COOKIE", ""))
                     if json_data:
-                        save_json_file_quark(message,json_data)
-                        #parse_share_link(message, kuake_link, get_int_env("ENV_123_KUAKE_UPLOAD_PID", 0))                
+                        save_json_file_quark(message, json_data)
                     else:
                         logger.error(f"夸克分享转存123出错")
                         reply_thread_pool.submit(send_reply, message, f"夸克分享转存123出错")
+                
+                # [新增] 专门捕获 Cookie 失效异常
+                except QuarkCookieError as e:
+                    fail_count += 1
+                    logger.error(f"夸克Cookie异常: {e}")
+                    # 发送通知给用户
+                    reply_thread_pool.submit(send_reply, message, f"🚨 **夸克转存中断**\n原因: Cookie 已失效或接口异常。\n详情: {str(e)}\n👉 请更新 `ENV_KUAKE_COOKIE` 后重试。")
+                
                 except Exception as e:
                     fail_count += 1
                     logger.error(f"转存异常: {url}, 错误: {str(e)}")
-            #time.sleep(3)
-            #reply_thread_pool.submit(send_reply, message, f"转存完成：成功{success_count}个，失败{fail_count}个")
+            
             user_state_manager.clear_state(user_id)
             return
 
