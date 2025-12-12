@@ -55,8 +55,6 @@ document.addEventListener('DOMContentLoaded', function() {
                     group.appendChild(header);
 
                     sections[sectionName].forEach(item => {
-                        // 特殊处理：ENV_189_COOKIES
-                        // 如果遇到这个变量，不生成通用输入框，而是将其值填充到专用卡片中
                         if (item.key === 'ENV_189_COOKIES') {
                             const manualInput = document.getElementById('ty-manual-cookie');
                             if (manualInput) {
@@ -200,12 +198,7 @@ function tgVerifyCode() {
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({code})
     })
-    .then(res => {
-        if (!res.ok) {
-            throw new Error(`Server error: ${res.status}`);
-        }
-        return res.json();
-    })
+    .then(res => res.json())
     .then(data => {
         hideLoading();
         if (data.success) {
@@ -326,51 +319,271 @@ function restartService(skipConfirm = true) {
         });
 }
 
-let logAutoRefreshInterval = null;
+// ================= 实时日志流系统 (SSE Real-time) =================
 
-function loadLogs() {
+let eventSource = null;
+let logBuffer = []; // 缓冲池，避免高频渲染卡顿
+let isRenderPending = false;
+
+// 启动实时日志
+function startLogStream() {
     const viewer = document.getElementById('log-viewer');
-    if (!viewer) return;
+    const btn = document.getElementById('btn-log-switch');
+    
+    // 防止重复开启
+    if (eventSource) return;
 
-    if (viewer.textContent === '正在加载日志...') {
-        viewer.textContent = '加载中...';
+    if (viewer) {
+        viewer.innerHTML = ''; // 清空旧日志
+        viewer.innerHTML = '<div class="log-system-msg"><i class="fas fa-satellite-dish fa-spin"></i> 正在建立实时连接...</div>';
     }
 
-    fetch('/api/logs')
-        .then(res => res.json())
-        .then(data => {
-            if (data.success) {
-                const isAtBottom = viewer.scrollHeight - viewer.scrollTop <= viewer.clientHeight + 50;
-                viewer.textContent = data.data || '暂无日志内容';
-                if (isAtBottom || viewer.scrollTop === 0) {
-                    viewer.scrollTop = viewer.scrollHeight;
-                }
-            } else {
-                viewer.textContent = '读取日志失败: ' + data.error;
-            }
-        })
-        .catch(err => {
-            console.error(err);
-            if (!logAutoRefreshInterval) {
-                viewer.textContent = '请求失败，请检查网络连接。';
-            }
-        });
+    // 建立 SSE 连接
+    eventSource = new EventSource('/api/stream_logs');
+
+    // 1. 接收消息
+    eventSource.onmessage = function(event) {
+        // 将新消息放入缓冲池
+        logBuffer.push(event.data);
+        
+        // 如果没有渲染任务在排队，则发起一次渲染
+        if (!isRenderPending) {
+            requestAnimationFrame(processLogBuffer);
+            isRenderPending = true;
+        }
+    };
+
+    // 2. 错误处理
+    eventSource.onerror = function(err) {
+        console.error("SSE Error:", err);
+        eventSource.close();
+        eventSource = null;
+        if (viewer) {
+            const errDiv = document.createElement('div');
+            errDiv.className = 'log-line error-line';
+            errDiv.innerHTML = '<span class="log-badge tag-other">SYSTEM</span> 连接已断开，请点击“开始实时”重连';
+            viewer.appendChild(errDiv);
+        }
+        updateLogBtnState(false);
+    };
+
+    updateLogBtnState(true);
 }
 
-document.getElementById('auto-refresh-log')?.addEventListener('change', function(e) {
-    if (e.target.checked) {
-        loadLogs();
-        logAutoRefreshInterval = setInterval(loadLogs, 5000);
-    } else {
-        stopAutoRefresh();
+// 关闭实时日志
+function stopLogStream() {
+    if (eventSource) {
+        eventSource.close();
+        eventSource = null;
     }
-});
+    updateLogBtnState(false);
+    
+    const viewer = document.getElementById('log-viewer');
+    if(viewer) {
+        const div = document.createElement('div');
+        div.className = 'log-line';
+        div.style.borderLeft = "3px solid #777";
+        div.style.opacity = "0.7";
+        div.innerHTML = '<span class="log-badge tag-other">PAUSED</span> 实时流已暂停';
+        viewer.appendChild(div);
+        viewer.scrollTop = viewer.scrollHeight;
+    }
+}
 
-function stopAutoRefresh() {
-    if (logAutoRefreshInterval) {
-        clearInterval(logAutoRefreshInterval);
-        logAutoRefreshInterval = null;
+// 切换开关
+function toggleLogStream() {
+    if (eventSource) {
+        stopLogStream();
+    } else {
+        startLogStream();
     }
-    const checkbox = document.getElementById('auto-refresh-log');
-    if (checkbox) checkbox.checked = false;
+}
+
+// 更新按钮文字
+function updateLogBtnState(isRunning) {
+    const btn = document.getElementById('btn-log-switch');
+    if (!btn) return;
+    
+    if (isRunning) {
+        btn.classList.remove('btn-secondary');
+        btn.classList.add('btn-success');
+        btn.innerHTML = '<i class="fas fa-pause"></i> 暂停实时';
+        // 自动滚动开关：默认开启
+        document.getElementById('auto-scroll-log').disabled = false;
+    } else {
+        btn.classList.remove('btn-success');
+        btn.classList.add('btn-secondary');
+        btn.innerHTML = '<i class="fas fa-play"></i> 开始实时';
+    }
+}
+
+// 批量处理缓冲区日志 (性能优化核心)
+function processLogBuffer() {
+    const viewer = document.getElementById('log-viewer');
+    if (!viewer || logBuffer.length === 0) {
+        isRenderPending = false;
+        return;
+    }
+
+    // 移除初始的加载提示
+    const loader = viewer.querySelector('.log-system-msg');
+    if (loader) loader.remove();
+
+    const fragment = document.createDocumentFragment();
+    const filterValue = document.getElementById('logFilter').value;
+    const hideWerkzeug = document.getElementById('hide-werkzeug').checked;
+
+    // 取出缓冲区所有数据
+    const batch = logBuffer.splice(0, logBuffer.length);
+
+    batch.forEach(line => {
+        if (!line.trim()) return;
+        const el = createLogLineElement(line, filterValue, hideWerkzeug);
+        fragment.appendChild(el);
+    });
+
+    viewer.appendChild(fragment);
+
+    // 限制 DOM 节点数量，防止内存泄漏 (保留最近 2000 行)
+    while (viewer.children.length > 2000) {
+        viewer.removeChild(viewer.firstChild);
+    }
+
+    // 自动滚动
+    if (document.getElementById('auto-scroll-log').checked) {
+        viewer.scrollTop = viewer.scrollHeight;
+    }
+
+    isRenderPending = false;
+    
+    // 如果处理完这一批，缓冲区又有新数据了，继续处理
+    if (logBuffer.length > 0) {
+        requestAnimationFrame(processLogBuffer);
+        isRenderPending = true;
+    }
+}
+
+// 创建单行日志 DOM (解析逻辑)
+function createLogLineElement(line, filterValue, hideWerkzeug) {
+    // 正则解析：时间 - 模块 - 级别 - 内容
+    const logRegex = /^(\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}:\d{2}(?:,\d+)?)\s-\s(\S+)\s-\s([A-Z]+)\s-\s(.*)$/;
+    
+    let category = 'other';
+    let level = 'INFO';
+    let timeStr = '';
+    let msgStr = line;
+    let isFormatted = false;
+
+    const match = line.match(logRegex);
+    if (match) {
+        isFormatted = true;
+        timeStr = match[1].split(',')[0]; // 去掉毫秒
+        category = match[2];
+        level = match[3];
+        msgStr = match[4];
+    } else {
+        // 失败回退逻辑
+        if (line.includes('werkzeug')) category = 'werkzeug';
+        else if (line.includes('bot115')) category = 'bot115';
+        else if (line.includes('bot189')) category = 'bot189';
+        else if (line.includes('quark')) category = 'quark';
+        
+        if (line.includes('ERROR') || line.includes('Traceback')) level = 'ERROR';
+        else if (line.includes('WARNING')) level = 'WARNING';
+    }
+
+    // 判断显隐
+    let isHidden = false;
+    if (filterValue !== 'all') {
+        if (category !== filterValue && !category.includes(filterValue)) isHidden = true;
+    } else {
+        if (hideWerkzeug && (category === 'werkzeug' || line.includes(' /api/'))) isHidden = true;
+    }
+
+    const div = document.createElement('div');
+    div.className = `log-entry level-${level} item-${category}`;
+    if (isHidden) div.classList.add('hidden');
+
+    if (isFormatted) {
+        let modClass = 'mod-other';
+        if (category.includes('115')) modClass = 'mod-115';
+        else if (category.includes('189')) modClass = 'mod-189';
+        else if (category.includes('quark')) modClass = 'mod-quark';
+        else if (category.includes('main')) modClass = 'mod-main';
+        else if (category.includes('mp')) modClass = 'mod-mp';
+        else if (category.includes('werkzeug')) modClass = 'mod-web';
+
+        // 高亮关键词
+        let safeMsg = escapeHtml(msgStr)
+            .replace(/(Successfully|Success|成功|完成|✅)/gi, '<span style="color:#67c23a;font-weight:bold;">$1</span>')
+            .replace(/(Failed|Fail|Error|失败|错误|❌)/gi, '<span style="color:#f56c6c;font-weight:bold;">$1</span>')
+            .replace(/(\/s\/[a-zA-Z0-9]+)/g, '<span style="color:#e6a23c;">$1</span>'); // 高亮链接Key
+
+        div.innerHTML = `
+            <span class="log-time">${timeStr}</span>
+            <span class="log-badge ${modClass}">${category}</span>
+            <span class="log-msg">${safeMsg}</span>
+        `;
+    } else {
+        // Traceback 或非标准行
+        if (level === 'ERROR' || line.trim().startsWith('Traceback') || line.trim().startsWith('File "')) {
+            div.classList.add('log-traceback');
+        }
+        div.textContent = line;
+    }
+    
+    return div;
+}
+
+// 纯前端筛选应用 (切换下拉框时调用)
+function applyLogFilter() {
+    const filterValue = document.getElementById('logFilter').value;
+    const hideWerkzeug = document.getElementById('hide-werkzeug').checked;
+    
+    // 遍历当前 DOM 中所有日志行进行显隐切换
+    const entries = document.querySelectorAll('.log-entry');
+    entries.forEach(row => {
+        let isHidden = false;
+        
+        // 从 class 中提取 category
+        let category = 'other';
+        row.classList.forEach(c => { if(c.startsWith('item-')) category = c.replace('item-', ''); });
+
+        if (filterValue !== 'all') {
+            if (category !== filterValue && !category.includes(filterValue)) isHidden = true;
+        } else {
+            if (hideWerkzeug && (category === 'werkzeug' || category === 'other')) {
+                // 简单判定：如果是 werkzeug 或者是 other 且包含 HTTP 动词
+                if (category === 'werkzeug' || row.textContent.includes('HTTP/1.')) isHidden = true;
+            }
+        }
+
+        if (isHidden) row.classList.add('hidden');
+        else row.classList.remove('hidden');
+    });
+    
+    // 筛选后滚动到底部
+    const viewer = document.getElementById('log-viewer');
+    if (document.getElementById('auto-scroll-log').checked) {
+        viewer.scrollTop = viewer.scrollHeight;
+    }
+}
+
+// 当用户切换到日志 Tab 时，自动开启流
+const logsTabBtn = document.querySelector('button[data-target="logs"]');
+if(logsTabBtn) {
+    logsTabBtn.addEventListener('click', () => {
+        // 延迟一点点，确保 DOM 切换完成
+        setTimeout(() => {
+            if(!eventSource) startLogStream();
+        }, 100);
+    });
+}
+
+// 页面卸载或切换 Tab 时可以考虑关闭流节省资源 (可选，这里暂时不加，保持后台监控)
+// window.addEventListener('beforeunload', stopLogStream);
+
+function escapeHtml(text) {
+    if (!text) return '';
+    return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#039;");
 }
