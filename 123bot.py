@@ -3158,7 +3158,7 @@ def handle_general_message(message):
                         if result:
                             success_count += 1
                             logger.info(f"天翼云转存成功: {url}")
-                            reply_thread_pool.submit(send_reply, message, f"✅ 已转存到天翼云盘 (123秒传失败)\n链接: {url}\n请稍后使用 /sync189 进行同步。")
+                            reply_thread_pool.submit(send_reply, message, f"✅ 已转存到天翼云盘 (123秒传未完全覆盖)\n链接: {url}\n请稍后使用 /sync189 进行同步。")
                         else:
                             fail_count += 1
                             logger.error(f"天翼云转存失败: {url}")
@@ -4470,14 +4470,15 @@ quark_folder_lock = threading.Lock()
 def process_single_quark_file(client, file_info, common_path, target_dir_id, folder_cache, uses_v2_etag):
     """单个夸克文件处理函数 (用于多线程并发)"""
     file_path = file_info.get('path', '')
+    
     if check_ext_filter(file_path):
         return {
-            "success": True, # 视为成功以免报错
+            "success": True,   
             "file_name": file_path, 
             "size": 0, 
-            "skip": True, # 标记为跳过
-            "msg": "后缀过滤"
-        }    
+            "skip": False, 
+            "msg": "后缀过滤"  
+        }  
     
     # 构建完整文件路径
     if common_path:
@@ -4612,10 +4613,16 @@ def save_json_file_quark(message, json_data):
         # 2. 初始化统计变量
         results = []
         total_size = 0
-        skip_count = 0
-        success_count = 0
-        fail_count = 0
+        skip_count = 0     # 重复跳过
+        filter_count = 0   # 后缀过滤
+        success_count = 0  # 实际成功
+        fail_count = 0     # 失败
         
+        # [新增] 视频统计变量
+        video_count = 0
+        video_total_size = 0
+        video_exts = {'.mkv', '.mp4', '.avi', '.mov', '.ts', '.rmvb', '.iso', '.wmv', '.m2ts', '.mpg', '.flv', '.rm'}
+
         # 用于收集失败文件的列表
         failed_files_data = []
         
@@ -4648,13 +4655,33 @@ def save_json_file_quark(message, json_data):
                 file_info = future_to_file[future]
                 res = future.result()
                 
+                # 统计逻辑
                 if res['success']:
-                    success_count += 1
-                    if res.get('skip'):
+                    # 检查是否为后缀过滤
+                    if res.get('msg') == "后缀过滤":
+                        filter_count += 1
+                    
+                    # 检查是否为重复跳过
+                    elif res.get('skip'):
                         skip_count += 1
-                        logger.info(f"🔄 [夸克] 跳过重复: {res['file_name']}")
+                        success_count += 1 # 逻辑上算成功
+                        # 统计视频信息（重复的也算在视频统计里，看需求，通常算了总数也要算这个）
+                        fname = res.get('file_name', '')
+                        fsize = res.get('size', 0)
+                        if os.path.splitext(fname)[1].lower() in video_exts:
+                            video_count += 1
+                            video_total_size += fsize
+                        
+                    # 正常转存成功
                     else:
+                        success_count += 1
                         total_size += res['size']
+                        # 统计视频信息
+                        fname = res.get('file_name', '')
+                        fsize = res.get('size', 0)
+                        if os.path.splitext(fname)[1].lower() in video_exts:
+                            video_count += 1
+                            video_total_size += fsize
                         logger.info(f"✅ [夸克] 秒传成功: {res['file_name']}")
                 else:
                     fail_count += 1
@@ -4671,6 +4698,7 @@ def save_json_file_quark(message, json_data):
                     progress_msg = (
                         f"📊 转存进度: {processed_count}/{total_files_count} ({percent}%)\n"
                         f"✅ 成功: {success_count} (跳过 {skip_count})\n"
+                        f"🚫 过滤: {filter_count}\n"
                         f"❌ 失败: {fail_count}"
                     )
                     reply_thread_pool.submit(send_reply_delete, message, progress_msg)
@@ -4686,12 +4714,24 @@ def save_json_file_quark(message, json_data):
         total_size_gb = total_size / (1024 ** 3)
         size_str = f"{total_size_gb:.2f}GB"
         
+        # 计算视频平均大小
+        video_avg_size_str = "0B"
+        video_total_size_str = get_formatted_size(video_total_size)
+        if video_count > 0:
+            video_avg_size_str = get_formatted_size(video_total_size / video_count)
+
         result_msg = (
             f"✅ 夸克转存任务完成！\n"
             f"📂 总文件: {total_files_count}个\n"
             f"✅ 成功: {success_count}个\n"
             f"❌ 失败: {fail_count}个\n"
             f"🔄 跳过重复: {skip_count}个\n"
+            f"🚫 后缀过滤: {filter_count}个\n"
+            f"----------------------\n"
+            f"🎬 视频统计: {video_count}个\n"
+            f"📹 视频总大: {video_total_size_str}\n"
+            f"📏 平均大小: {video_avg_size_str}\n"
+            f"----------------------\n"
             f"📦 实际转存: {size_str}\n"
             f"⏱️ 耗时: {time_str}"
         )
