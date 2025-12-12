@@ -41,7 +41,7 @@ logging.getLogger("httpx").setLevel(logging.ERROR)
 logging.getLogger("urllib3.connectionpool").setLevel(logging.ERROR)
 logging.getLogger("telebot").setLevel(logging.ERROR)
 
-version = "8.0.4"  
+version = "8.0.5"  
 newest_id = 50
 # 加载.env文件中的环境变量
 load_dotenv(dotenv_path="db/user.env",override=True)
@@ -146,7 +146,10 @@ root_logger.addHandler(console_handler)
 # 测试：任意模块的logger都会遵循全局配置
 # ----------------------
 # 示例1：当前模块的logger
-logger = logging.getLogger(__name__)
+if __name__ == "__main__":
+    logger = logging.getLogger("main") # 或者 "mp_main" 取决于你的偏好
+else:
+    logger = logging.getLogger("mp_main")
 import threading
 import concurrent.futures
 # 创建大小为1的线程池用于发送消息
@@ -621,7 +624,7 @@ while True and __name__ == "__mp_main__":
         ]
         # 设置命令菜单
         bot.set_my_commands(commands)
-        logger.info("已设置Bot命令菜单：/start, /share, /info, /add, /remove")
+        logger.info("已设置Bot命令菜单：/start, /sync189，/share, /info, /add, /remove")
         logger.info("TeleBot初始化成功")
         break  # 初始化成功，退出循环
     except Exception as e:
