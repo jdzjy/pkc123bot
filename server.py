@@ -17,7 +17,7 @@ except ImportError:
     get_download_url_by_path = lambda x: None
     get_download_url_by_path_xiaohao = lambda x, y: None
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("server")
 logging.basicConfig(level=logging.INFO)
 
 app = Flask(__name__)
@@ -291,6 +291,48 @@ def restart_server():
 
     threading.Thread(target=restart_thread).start()
     return jsonify({'success': True, 'message': '服务正在重启...'}) 
+
+# ================= 新增：实时日志流接口 (SSE) =================
+from flask import Response, stream_with_context
+
+@app.route('/api/stream_logs')
+def stream_logs():
+    if not session.get('logged_in'):
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    def generate():
+        # 尝试打开日志文件
+        if not os.path.exists(LOG_FILE_PATH):
+            yield "data: [系统提示] 日志文件尚未生成...\n\n"
+            return
+
+        # 1. 检测文件编码
+        encoding = 'utf-8'
+        try:
+            with open(LOG_FILE_PATH, 'r', encoding='utf-8') as f:
+                f.read(1024)
+        except UnicodeDecodeError:
+            encoding = 'gbk'
+
+        with open(LOG_FILE_PATH, 'r', encoding=encoding, errors='ignore') as f:
+            lines = f.readlines()
+            tail_lines = lines[-200:]
+            for line in tail_lines:
+                # SSE 格式要求：data: 内容\n\n
+                yield f"data: {line.rstrip()}\n\n"
+            
+            f.seek(0, 2) 
+            
+            while True:
+                line = f.readline()
+                if line:
+                    yield f"data: {line.rstrip()}\n\n"
+                else:
+                    time.sleep(0.5) # 没有新日志时，休眠 0.5秒 避免占用 CPU
+                    # 发送心跳包防止连接超时 (可选)
+                    # yield ": heartbeat\n\n"
+
+    return Response(stream_with_context(generate()), mimetype='text/event-stream')
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=12366, debug=False)
