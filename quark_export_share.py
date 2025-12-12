@@ -1,5 +1,4 @@
 import logging
-#logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 import asyncio
 import json
@@ -10,35 +9,29 @@ import asyncio
 import os
 import re
 
+
+class QuarkCookieError(Exception):
+    pass
+
 # 从分享URL中提取分享ID和密码
 def extract_share_info_from_url(share_url):
-    # 匹配分享URL格式，提取分享ID
     share_id_match = re.search(r'/s/([a-zA-Z0-9]+)', share_url)
     if not share_id_match:
         raise ValueError(f"无效的分享URL: {share_url}")
     share_id = share_id_match.group(1)
-    # 提取密码（如果有）
     password_match = re.search(r'pwd=([a-zA-Z0-9]+)', share_url)
     password = password_match.group(1) if password_match else ""
     return share_id, password
 
 def sanitize_string(s: str) -> str:
-    """
-    清理字符串中的无效Unicode字符，以避免编码错误。
-    参数:
-        s (str): 待处理的字符串。
-    返回:
-        str: 清理后的字符串。
-    """
     return s.encode('utf-8', errors='replace').decode('utf-8')
 
+# [保持原有函数，虽然现在不使用了，但留着防止报错]
 def should_skip_quark_file(filename):
     env_filter = os.getenv("ENV_EXT_FILTER", "")
-    if not env_filter:
-        return False
+    if not env_filter: return False
     skip_exts = [ext.strip().lower() for ext in env_filter.split(',') if ext.strip()]
-    if not filename:
-        return False
+    if not filename: return False
     _, ext = os.path.splitext(filename)
     return ext.lower() in skip_exts
 
@@ -47,6 +40,11 @@ def export_share_info(share_url, cookie=""):
             "usesBase62EtagsInExport": False,
             "files": [],
         }
+    
+    if not cookie:
+        # [修改] 直接抛出异常，通知主程序
+        raise QuarkCookieError("未配置 ENV_KUAKE_COOKIE，请填写 Cookie")
+
     async def main(batch_size: int = 50):
         start_time = time.time()
         my_cookie = cookie  
@@ -62,99 +60,108 @@ def export_share_info(share_url, cookie=""):
             share_info_result = await quark.get_share_info(code, password)
             logger.info("--- 正在获取分享信息 --- ")
             
-            if share_info_result.get("code") == 0:
-                stoken = share_info_result["data"]["stoken"]
-                
-                # 2. 收集所有文件信息 (优先直接读取列表中的MD5)
-                logger.info(f"--- 正在收集文件信息 --- ")
-                
-                # 待补充MD5的文件列表 (fid, token)
-                files_needing_md5 = []
-                # 待补充MD5的文件映射 {fid: file_base_obj}
-                file_mapping = {}
-                
-                async for file_info in quark.get_share_file_list(
-                    code=code,
-                    passcode=password,
-                    stoken=stoken,
-                    dir_id=0,
-                    is_get_folder=False,
-                    is_recursion=True,
-                ):
+            # [关键修改] 如果获取分享信息失败，大概率是 Cookie 失效或 IP 风控
+            if share_info_result.get("code") != 0:
+                err_msg = f"获取分享信息失败: {share_info_result.get('message')} (Code: {share_info_result.get('code')})"
+                logger.error(err_msg)
+                # 抛出异常，触发 Bot 通知
+                raise QuarkCookieError(f"Cookie可能已失效或分享链接无效。API返回: {share_info_result.get('message')}")
 
-                    clean_path = sanitize_string(file_info["RootPath"].lstrip('/'))
-                    
-                    file_base = {
-                        "size": file_info["size"],
-                        "path": clean_path,
-                    }
-                    
-                    # === 核心修复逻辑开始 ===
-                    # 优先检查文件列表原始数据中是否已有有效的 MD5
-                    origin_md5 = file_info.get("md5")
-                    
-                    if origin_md5 and isinstance(origin_md5, str) and len(origin_md5) == 32:
-                        # 如果已有32位标准MD5，直接使用
-                        file_base["etag"] = origin_md5.lower()
-                        json_data["files"].append(file_base)
-                    else:
-                        # 只有当列表中没有MD5时，才加入“待获取队列”
-                        file_mapping[file_info["fid"]] = file_base
-                        files_needing_md5.append((file_info["fid"], file_info["share_fid_token"]))
-                    # === 核心修复逻辑结束 ===
-                    
-                total_needing = len(files_needing_md5)
-                total_found = len(json_data["files"])
-                logger.info(f"--- 初步扫描: {total_found} 个文件已获取MD5，{total_needing} 个文件需进一步请求 --- ")
+            stoken = share_info_result["data"]["stoken"]
+            
+            # 2. 收集所有文件信息
+            logger.info(f"--- 正在收集文件信息 --- ")
+            
+            files_needing_md5 = []
+            file_mapping = {}
+            
+            async for file_info in quark.get_share_file_list(
+                code=code,
+                passcode=password,
+                stoken=stoken,
+                dir_id=0,
+                is_get_folder=False,
+                is_recursion=True,
+            ):
+                clean_path = sanitize_string(file_info["RootPath"].lstrip('/'))
                 
-                # 3. 仅对缺失MD5的文件批量获取
-                if total_needing > 0:
-                    logger.info(f"--- 开始批量获取剩余文件的MD5 (批次大小: {batch_size}) --- ")
-                    md5_results = await quark.batch_send_create_share_download_request(
-                        code=code,
-                        pwd=password,
-                        stoken=stoken,
-                        file_info_list=files_needing_md5,
-                        batch_size=batch_size
-                    )
+                # [关键] 不过滤文件，全部交给主程序处理
+                # if should_skip_quark_file(clean_path): continue
+                
+                file_base = {
+                    "size": file_info["size"],
+                    "path": clean_path,
+                }
+                
+                origin_md5 = file_info.get("md5")
+                
+                if origin_md5 and isinstance(origin_md5, str) and len(origin_md5) == 32:
+                    file_base["etag"] = origin_md5.lower()
+                    json_data["files"].append(file_base)
+                else:
+                    file_mapping[file_info["fid"]] = file_base
+                    files_needing_md5.append((file_info["fid"], file_info["share_fid_token"]))
+                
+            total_needing = len(files_needing_md5)
+            total_found = len(json_data["files"])
+            logger.info(f"--- 初步扫描: {total_found} 个文件已获MD5，{total_needing} 个需进一步请求 --- ")
+            
+            # 3. 批量获取剩余文件的MD5 (含重试机制)
+            if total_needing > 0:
+                for i in range(0, total_needing, batch_size):
+                    batch_files = files_needing_md5[i : i + batch_size]
                     
-                    # 4. 处理补充结果
-                    for fid, file_base in file_mapping.items():
-                        # [重点修复] 增加 .get('md5') 的非空判断
-                        # 只有当 md5 存在且不为空字符串时才处理
+                    retry_count = 3
+                    md5_results = {}
+                    
+                    while retry_count > 0:
+                        try:
+                            md5_results = await quark.batch_send_create_share_download_request(
+                                code=code,
+                                pwd=password,
+                                stoken=stoken,
+                                file_info_list=batch_files,
+                                batch_size=batch_size
+                            )
+                            if md5_results: break
+                        except Exception as e:
+                            logger.warning(f"获取MD5异常: {e}")
+                        
+                        retry_count -= 1
+                        if retry_count > 0:
+                            logger.info(f"网络波动，等待 2 秒后重试 (剩余 {retry_count} 次)...")
+                            await asyncio.sleep(2)
+                    
+                    # [新增] 如果重试耗尽且完全没结果，可能也是 Cookie/风控 问题
+                    if not md5_results:
+                        logger.warning("⚠️ 本批次 MD5 获取完全失败，可能是接口风控")
+                        # 这里可以选择是否抛出异常，或者继续尝试下一批
+                        # 为了稳定性，暂时只记录警告，不中断整个任务
+                    
+                    # 处理结果
+                    for fid, _ in batch_files:
+                        file_base = file_mapping.get(fid)
+                        if not file_base: continue
+
                         if fid in md5_results and md5_results[fid].get('md5'):
                             md5_info = md5_results[fid]
                             raw_md5 = md5_info['md5']
-                            final_md5 = ""
-                            
+                            final_md5 = raw_md5
                             try:
-                                # 处理可能的 Base64 编码
-                                if '==' in raw_md5:    
-                                    final_md5 = base64.b64decode(raw_md5).hex()
-                                else:    
-                                    final_md5 = raw_md5
-                            except Exception: 
-                                final_md5 = raw_md5 
+                                if '==' in raw_md5: final_md5 = base64.b64decode(raw_md5).hex()
+                            except Exception: pass
                                 
                             file_base["etag"] = final_md5
                             json_data["files"].append(file_base)
                         else:
-                            # 如果 MD5 为空，记录明确的警告日志
-                            # 这些文件如果不包含 etag，秒传肯定会失败，但为了保持文件列表完整性，
-                            # 我们可以选择跳过或者依然加入（但 etag 为空）。
-                            # 这里选择依然加入，但打出警告，方便用户在日志中看到哪些文件出问题了。
-                            logger.warning(f"⚠️ 文件无法获取MD5 (API返回空值): {file_base['path']}")
+                            logger.warning(f"⚠️ 无法获取MD5: {file_base['path']}")
                             file_base["etag"] = "" 
                             json_data["files"].append(file_base)
-                            
-                logger.info(f"--- 信息收集完成，共 {len(json_data['files'])} 个文件 ---")
-
-            else:
-                logger.error(f"--- 获取分享信息失败，错误码: {share_info_result.get('code')} --- ")
+                        
+            logger.info(f"--- 信息收集完成，共 {len(json_data['files'])} 个文件 ---")
         
         end_time = time.time()
-        execution_time = end_time - start_time
-        logger.info(f"总耗时: {execution_time:.2f} 秒")
+        logger.info(f"总耗时: {end_time - start_time:.2f} 秒")
         
     asyncio.run(main())
     return json_data
