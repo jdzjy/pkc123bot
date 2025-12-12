@@ -3,14 +3,178 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>123bot 控制台</title>
-    <!-- 使用 FontAwesome 6 -->
+    <title>123Bot 控制台</title>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <link rel="stylesheet" href="/static/styles.css">
+    
+    <style>
+        /* ================= 日志终端专业版样式 (VS Code 风格) ================= */
+        :root {
+            --log-bg: #15192b;       
+            --log-hover: #1e2338;    
+            --log-border: #2a2f4a;      
+            --text-main: #d0d7de;    
+            --text-dim: #6c757d;     
+            --col-info: #58a6ff;     
+            --col-warn: #d29922;     
+            --col-error: #f85149;
+        }
+
+        /* 日志容器 */
+        .log-container-wrapper {
+            background-color: var(--log-bg);
+            border: 1px solid var(--log-border);
+            border-radius: 6px;
+            box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+            display: flex;
+            flex-direction: column;
+            height: 780px; /* 固定高度 */
+            font-family: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace;
+        }
+
+        /* 顶部工具栏 */
+        .log-toolbar {
+            background-color: #1a1f32; /* 比日志背景稍亮 */
+            padding: 10px 16px;
+            border-bottom: 1px solid var(--log-border);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            user-select: none;
+        }
+
+        .toolbar-group {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        /* 下拉筛选框背景 */
+        .log-select {
+            background-color: #252a40;
+            color: #eee;
+            border: 1px solid #3b4261;
+            padding: 4px 10px;
+            border-radius: 4px;
+            font-size: 12px;
+            outline: none;
+            transition: border 0.2s;
+        }
+        .log-select:focus { border-color: var(--col-info); }
+
+        /* 复选框美化 */
+        .log-checkbox-label {
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 12px;
+            color: #aaa;
+            transition: color 0.2s;
+        }
+        .log-checkbox-label:hover { color: #fff; }
+        .log-checkbox-label input { accent-color: var(--col-info); cursor: pointer; }
+
+        /* --- 日志内容区域 --- */
+        #log-viewer {
+            flex: 1;
+            overflow-y: auto;
+            overflow-x: hidden;
+            padding: 10px 0;
+            font-size: 13px;
+            line-height: 1.5;
+            scroll-behavior: smooth;
+        }
+
+        /* 滚动条美化 */
+        #log-viewer::-webkit-scrollbar { width: 10px; }
+        #log-viewer::-webkit-scrollbar-track { background: var(--log-bg); }
+        #log-viewer::-webkit-scrollbar-thumb { background: #424242; border-radius: 5px; border: 2px solid var(--log-bg); }
+        #log-viewer::-webkit-scrollbar-thumb:hover { background: #5a5a5a; }
+
+        /* --- 单条日志行布局 --- */
+        .log-entry {
+            display: flex;
+            padding: 2px 16px;
+            border-left: 3px solid transparent; /* 状态指示条 */
+            align-items: flex-start;
+        }
+        .log-entry:hover { background-color: var(--log-hover); }
+        .log-entry.hidden { display: none !important; }
+
+        /* 1. 时间列 */
+        .log-time {
+            color: var(--text-dim);
+            min-width: 140px;
+            font-size: 12px;
+            flex-shrink: 0;
+            white-space: nowrap;
+            margin-right: 12px;
+            padding-top: 1px;
+        }
+
+        /* 2. 模块标签 Badge */
+        .log-badge {
+            display: inline-block;
+            padding: 1px 6px;
+            border-radius: 4px;
+            font-size: 11px;
+            font-weight: 700;
+            margin-right: 12px;
+            min-width: 65px;
+            text-align: center;
+            color: #fff;
+            text-shadow: 0 1px 2px rgba(0,0,0,0.3);
+            flex-shrink: 0;
+            letter-spacing: 0.5px;
+        }
+
+        /* 3. 内容列 */
+        .log-msg {
+            flex: 1;
+            color: var(--text-main);
+            white-space: pre-wrap;
+            word-break: break-all;
+        }
+
+        /* --- 颜色定义 --- */
+        .mod-115 { background-color: #27ae60; }   /* 绿色 */
+        .mod-189 { background-color: #2980b9; }   /* 蓝色 */
+        .mod-quark { background-color: #16a085; } /* 青色 */
+        .mod-main { background-color: #d35400; }  /* 深橙 */
+        .mod-mp { background-color: #8e44ad; }    /* 紫色 */
+        .mod-web { background-color: #7f8c8d; }   /* 灰色 */
+        .mod-other { background-color: #57606f; } /* 深灰 */
+
+        /* 级别高亮 */
+        .level-WARNING { border-left-color: var(--col-warn); background: rgba(230, 162, 60, 0.05); }
+        .level-WARNING .log-msg { color: #fae3b8; }
+        .level-WARNING .log-time { color: #e6a23c; }
+
+        .level-ERROR { border-left-color: var(--col-error); background: rgba(245, 108, 108, 0.1); }
+        .level-ERROR .log-msg { color: #ffbaba; font-weight: bold; }
+        .level-ERROR .log-time { color: #f56c6c; }
+
+        /* 堆栈跟踪 (Traceback) */
+        .log-traceback {
+            color: #ff9b9b;
+            padding-left: 215px; /* 对齐到消息内容区 */
+            font-size: 12px;
+            opacity: 0.9;
+            background: rgba(255, 0, 0, 0.03);
+            border-bottom: 1px solid rgba(255,255,255,0.03);
+        }
+        
+        /* 系统消息 */
+        .log-system-msg {
+            text-align: center;
+            padding-top: 150px;
+            color: #666;
+        }
+    </style>
 </head>
 <body>
     <div class="layout-container">
-        <!-- 侧边栏 -->
         <aside class="sidebar">
             <div class="logo-container">
                 <img src="/static/images/logo.svg" class="sidebar-logo-img" alt="Logo">
@@ -19,49 +183,36 @@
           
             <nav class="nav-menu">
                 <div class="nav-label">系统管理</div>
-                <!-- Web安全配置 -> web.svg -->
                 <button type="button" class="nav-item active" data-target="web">
-                    <img src="/static/images/web.svg" class="nav-icon-img" alt="Web">
+                    <img src="/static/images/web.svg" class="nav-icon-img" alt="Web"> 
                     <span>Web安全配置</span>
                 </button>
-                
-                <!-- TG 机器人/人形 -> userbot.png -->
                 <button type="button" class="nav-item" data-target="tg">
                     <img src="/static/images/userbot.png" class="nav-icon-img" alt="TG"> 
                     <span>TG 机器人/人形</span>
                 </button>
                 
                 <div class="nav-label" style="margin-top: 15px;">网盘配置</div>
-                
-                <!-- 123 云盘 -> 123.png -->
                 <button type="button" class="nav-item" data-target="123">
-                    <img src="/static/images/123.svg" class="nav-icon-img" alt="123">
+                    <img src="/static/images/123.svg" class="nav-icon-img" alt="123"> 
                     <span>123 云盘</span>
                 </button>
-                
-                <!-- 115 网盘 -> 115.png -->
                 <button type="button" class="nav-item" data-target="115">
-                    <img src="/static/images/115.png" class="nav-icon-img" alt="115">
+                    <img src="/static/images/115.png" class="nav-icon-img" alt="115"> 
                     <span>115 网盘</span>
                 </button>
-                
-                <!-- 天翼云盘 -> 189.svg -->
                 <button type="button" class="nav-item" data-target="ty">
-                    <img src="/static/images/189.svg" class="nav-icon-img" alt="189">
+                    <img src="/static/images/189.svg" class="nav-icon-img" alt="189"> 
                     <span>天翼云盘</span>
                 </button>
                 
                 <div class="nav-label" style="margin-top: 15px;">监控与维护</div>
-                
-                <!-- 实时运行日志 -> log.svg -->
                 <button type="button" class="nav-item" data-target="logs">
-                    <img src="/static/images/log.svg" class="nav-icon-img" alt="Log">
+                    <img src="/static/images/log.svg" class="nav-icon-img" alt="Log"> 
                     <span>实时运行日志</span>
                 </button>
-                
-                <!-- 高级/其他配置 -> gjsz.svg -->
                 <button type="button" class="nav-item" data-target="other">
-                    <img src="/static/images/gjsz.svg" class="nav-icon-img" alt="Other">
+                    <img src="/static/images/gjsz.svg" class="nav-icon-img" alt="Other"> 
                     <span>高级/其他配置</span>
                 </button>
             </nav>
@@ -73,7 +224,6 @@
             </div>
         </aside>
 
-        <!-- 主内容区 -->
         <main class="main-content">
             <header class="top-header">
                 <h2 id="page-title">Web安全配置</h2>
@@ -88,7 +238,6 @@
             </header>
 
             <div class="content-scroll">
-                <!-- TG Web 登录面板 (JS 控制显示) -->
                 <div id="tg-login-dashboard" style="display:none;">
                     <div class="config-group tg-login-card">
                         <h3><i class="fab fa-telegram-plane"></i> Telegram 账户状态</h3>
@@ -151,7 +300,6 @@
                     </div>
                 </div>
 
-                <!-- 动态表单挂载点 -->
                 <form id="env-form">
                     <div id="section-web" class="section-pane active"></div>
                     <div id="section-tg" class="section-pane"></div>
@@ -159,17 +307,14 @@
                     <div id="section-115" class="section-pane"></div>
                     
                     <div id="section-ty" class="section-pane">
-                        <!-- 手动Cookie 卡片 -->
                         <div class="config-group tg-login-card" style="margin-bottom: 20px; padding: 20px; border-color: rgba(255, 115, 0, 0.3); background: linear-gradient(to bottom, var(--bg-card), rgba(255, 115, 0, 0.05));">
                             <h3 style="font-size: 18px; margin-bottom: 15px; padding-bottom: 10px;"><i class="fas fa-key"></i> 天翼云盘登录</h3>
-                            
                             <div id="ty-tab-manual">
                                 <div class="config-item" style="margin-bottom: 15px;">
                                     <label style="margin-bottom: 8px; display: block; color: var(--text-main); font-weight: 500; font-size: 14px;">ENV_189_COOKIES (手动获取)</label>
                                     <div class="comment" style="margin-bottom: 8px;">
                                         PC浏览器登录 <a href="https://cloud.189.cn" target="_blank" style="color: #6366f1;">cloud.189.cn</a> -> F12抓包 -> 复制 main.action 的 Cookie 值。有效期约30天。
                                     </div>
-                                    <!-- 使用标准 input 替代 textarea，保持高度一致 -->
                                     <input type="text" id="ty-manual-cookie" placeholder="例如：COOKIE_LOGIN_USER=...; COOKIES_guid=..." autocomplete="off">
                                 </div>
                                 <button type="button" class="btn-primary" style="width: 100%;" onclick="saveTyCookie()">
@@ -179,22 +324,51 @@
                         </div>
                     </div>
                     
-                    <!-- 日志面板 -->
                     <div id="section-logs" class="section-pane">
-                        <div class="config-group" style="border-color: #333;">
-                            <div class="log-header">
-                                <h3><i class="fas fa-history"></i> 实时运行日志 (Tail 500)</h3>
-                                <div class="log-actions">
-                                    <label style="cursor:pointer; display:flex; align-items:center; gap:5px;">
-                                        <input type="checkbox" id="auto-refresh-log"> 
-                                        <span style="font-size:13px; color:var(--secondary-color);">自动刷新(5s)</span>
+                        <div class="log-container-wrapper">
+                            <div class="log-toolbar">
+                                <div class="toolbar-group">
+                                    <span style="font-weight: bold; color: #fff; font-size: 14px;"><i class="fas fa-terminal"></i> 终端</span>
+                                    
+                                    <select id="logFilter" class="log-select" onchange="applyLogFilter()">
+                                        <option value="all">🔍 显示全部模块</option>
+                                        <option value="bot115">📂 115网盘</option>
+                                        <option value="bot189">☁️ 天翼云盘</option>
+                                        <option value="quark">🪐 夸克网盘</option>
+                                        <option value="main">🤖 123Bot核心</option>
+                                        <option value="mp_main">⚙️ 多进程主控</option>
+                                        <option value="werkzeug">🌐 Web服务器</option>
+                                    </select>
+
+                                    <label class="log-checkbox-label" title="隐藏 GET/POST 请求日志，只看业务日志">
+                                        <input type="checkbox" id="hide-werkzeug" onchange="applyLogFilter()" checked>
+                                        <span>屏蔽 Web 请求</span>
                                     </label>
-                                    <button type="button" class="btn-secondary btn-sm" onclick="loadLogs()">
-                                        <i class="fas fa-sync-alt"></i> 立即刷新
+                                </div>
+                                
+                                <div class="toolbar-group">
+                                    <label class="log-checkbox-label">
+                                        <input type="checkbox" id="auto-scroll-log" checked> 
+                                        <span>自动滚动</span>
+                                    </label>
+                                    
+                                    <button type="button" id="btn-log-switch" class="btn-secondary btn-sm" onclick="toggleLogStream()" style="padding: 4px 12px; border:none; border-radius:3px; cursor:pointer; font-weight:500;">
+                                        <i class="fas fa-play"></i> 开始实时
+                                    </button>
+                                    
+                                    <button type="button" class="btn-outline-secondary btn-sm" onclick="document.getElementById('log-viewer').innerHTML=''" style="padding: 4px 8px; border:1px solid #555; background:transparent; color:#aaa; border-radius:3px; cursor:pointer;" title="清屏">
+                                        <i class="fas fa-trash-alt"></i>
                                     </button>
                                 </div>
                             </div>
-                            <pre id="log-viewer" class="log-viewer">正在连接日志接口...</pre>
+                            
+                            <div id="log-viewer">
+                                <div class="log-system-msg">
+                                    <i class="fas fa-satellite-dish fa-3x" style="margin-bottom: 20px; opacity: 0.5;"></i><br>
+                                    等待连接...<br>
+                                    <span style="font-size: 12px; opacity: 0.7;">点击右上角“开始实时”接入日志流</span>
+                                </div>
+                            </div>
                         </div>
                     </div>
 
