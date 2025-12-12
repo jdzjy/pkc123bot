@@ -60,7 +60,7 @@ class TransferResult:
     def __str__(self):
         return self.message
 
-logger = logging.getLogger("bot115")
+logger = logging.getLogger(__name__)
 banbenhao = "1.3.17" # 版本号：集成 ed2k 离线下载与 Telegraph 深度解析
 
 # 加载.env文件中的环境变量
