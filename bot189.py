@@ -1,6 +1,6 @@
 import json
 import time
-import requests
+from curl_cffi import requests
 from urllib import parse
 from concurrent.futures import ThreadPoolExecutor
 import threading
@@ -397,12 +397,17 @@ class Cloud189ShareInfo:
 
 class Cloud189:
     def __init__(self):
-        self.session = requests.session()
-        # 初始化时使用 PC User-Agent
-        self.session.headers = {
-            'User-Agent': PC_USER_AGENT,
+        # [修改] 使用 impersonate="chrome120" 模拟真实浏览器 (自动处理 TLS 指纹和 Header 顺序)
+        self.session = requests.Session(impersonate="chrome120")
+        
+        # [修改] 仅保留业务必要的 Headers
+        # 注意：不要手动设置 User-Agent，curl_cffi 会根据 impersonate 自动生成最匹配的 UA
+        self.session.headers.update({
             "Accept": "application/json;charset=UTF-8",
-        }
+            "Referer": "https://cloud.189.cn/",
+            "Origin": "https://cloud.189.cn",
+        })
+        
         # 尝试加载 ENV_189_COOKIES
         if ENV_189_COOKIES:
             self.load_cookies_from_str(ENV_189_COOKIES)
@@ -412,8 +417,13 @@ class Cloud189:
             return response.json()
         except Exception:
             try:
-                # 处理 BOM
-                text = response.content.decode('utf-8-sig').strip()
+                # [修改] curl_cffi 的 content 可能是 bytes，稳妥解码
+                content = response.content
+                if isinstance(content, bytes):
+                    text = content.decode('utf-8-sig', errors='replace').strip()
+                else:
+                    text = str(content).strip()
+                    
                 if not text:
                     return {"res_code": -1, "res_message": "Empty response"}
                 return json.loads(text)
@@ -729,11 +739,9 @@ class Cloud189:
     def get_folder_files_for_transfer(self, folder_id):
         """
         递归获取指定文件夹下的所有文件信息（含MD5）
-        兼容各种字段名缺失的情况
         """
         all_files = []
-        
-        # 待扫描的文件夹队列 (初始放入根目录ID)
+        # 待扫描的文件夹队列
         folder_queue = [(folder_id, "/")]
         
         scanned_folders = 0
@@ -750,8 +758,10 @@ class Cloud189:
             page_num = 1
             page_size = 200
             
-            try:
-                while True:
+            # 增加重试机制
+            retry_limit = 3
+            while retry_limit > 0:
+                try:
                     response = self.session.get(
                         "https://cloud.189.cn/api/open/file/listFiles.action",
                         params={
@@ -766,9 +776,15 @@ class Cloud189:
                     )
                     res = self._parse_json(response)
                     
+                    # [修正] 只要 res_code 不为 0，就打印完整响应
                     if res.get("res_code") != 0:
-                        log.error(f"获取天翼云目录[{current_path}]失败: {res.get('res_message')}")
-                        break
+                        log.error(f"🚫 获取天翼云目录[{current_path}]失败 (ID: {current_id})")
+                        log.error(f"🔍 API完整错误响应: {res}")
+                        
+                        # 如果是根目录第一次请求就失败，说明配置的 PID 有问题
+                        if scanned_folders == 1 and page_num == 1:
+                            return []
+                        break 
 
                     file_list_ao = res.get("fileListAO", {})
                     current_file_list = file_list_ao.get("fileList", [])
@@ -777,15 +793,11 @@ class Cloud189:
                     # --- 处理文件 ---
                     if current_file_list:
                         for file in current_file_list:
-                            # 必须确保有MD5值
                             if "md5" in file and file["md5"]:
-                                # [全面防御] 对所有字段使用 .get() 
-                                f_name = file.get("fileName") or file.get("name") or "Unknown_File"
-                                # 尝试获取大小，如果都没有则默认为 0
+                                f_name = file.get("fileName") or file.get("name") or "Unknown"
                                 f_size = file.get("fileSize") or file.get("size") or 0
                                 f_id = file.get("id") or file.get("fileId")
-                                
-                                if f_id: # 只有当ID存在时才添加
+                                if f_id:
                                     all_files.append({
                                         "file_id": f_id,
                                         "file_name": f_name,
@@ -797,24 +809,25 @@ class Cloud189:
                     # --- 处理文件夹 ---
                     if page_num == 1 and current_folder_list:
                         for folder in current_folder_list:
-                            # 文件夹通常使用 'name' 字段
-                            folder_name = folder.get("name") or folder.get("fileName") or "Unknown_Folder"
-                            folder_id = folder.get("id") or folder.get("fileId")
-                            
-                            if folder_id:
+                            folder_name = folder.get("name") or folder.get("fileName")
+                            folder_id_sub = folder.get("id") or folder.get("fileId")
+                            if folder_id_sub:
                                 sub_path = f"{current_path}{folder_name}/"
-                                folder_queue.append((folder_id, sub_path))
+                                folder_queue.append((folder_id_sub, sub_path))
 
                     # 翻页判断
                     current_page_count = len(current_file_list) + len(current_folder_list)
                     if current_page_count < page_size:
-                        break
+                        break # 结束分页
                     
                     page_num += 1
                     time.sleep(0.2)
                     
-            except Exception as e:
-                log.error(f"遍历天翼云目录[{current_path}]异常: {str(e)}")
+                except Exception as e:
+                    retry_limit -= 1
+                    if retry_limit == 0:
+                        log.error(f"遍历目录异常: {str(e)}")
+                    time.sleep(1)
         
         log.info(f"天翼云扫描结束: 共扫描 {scanned_folders} 个目录，发现 {len(all_files)} 个有效文件")
         return all_files
@@ -913,41 +926,60 @@ class Cloud189:
         try:
             url = parse.urlparse(link)
             try:
-                code = parse.parse_qs(url.query)["code"][0]
-            except (KeyError, IndexError):
-                path_parts = url.path.split('/')
-                if len(path_parts) >= 3 and path_parts[1] == 't':
-                    code = path_parts[2]
+                query = parse.parse_qs(url.query)
+                if "code" in query:
+                    code = query["code"][0]
                 else:
-                    raise Exception("无法从分享链接中提取分享码")
+                    path_parts = url.path.split('/')
+                    if len(path_parts) >= 3 and path_parts[1] == 't':
+                        code = path_parts[2]
+                    else:
+                        raise Exception("无法从分享链接中提取分享码")
+            except (KeyError, IndexError):
+                raise Exception("无法解析分享链接格式")
             
+            # 获取分享详情
             response = self.session.get("https://cloud.189.cn/api/open/share/getShareInfoByCodeV2.action", params={
                 "shareCode": code
             })
             result = self._parse_json(response)
 
             if result.get('res_code') != 0:
-                log.error(f"获取分享信息失败: {result.get('res_message', '未知错误')}")
+                err_msg = result.get('res_message') or f"完整响应: {result}"
+                log.error(f"获取分享信息失败: {err_msg}")
                 return None
             
             fileName = result['fileName']
+            # 清理文件名
             cleaned_fileName = clean_filename(fileName) + " " + time.strftime("[%m%d%H%M%S]")
+            
+            # 调用上面修改过的 createFolder
             folderId = self.createFolder(cleaned_fileName, parentFolderId)
             return folderId
+            
         except Exception as e:
-            log.error(f"从分享链接创建文件夹时发生异常: {e}")
+            # [修正] 打印具体的异常堆栈或信息
+            log.error(f"从分享链接创建文件夹时发生异常: {str(e)}")
             return None
 
     def createFolder(self, name, parentFolderId=-11):
-        response = self.session.post("https://cloud.189.cn/api/open/file/createFolder.action", data={
-            "parentFolderId": parentFolderId,
-            "folderName": name,
-        })
-        result = self._parse_json(response)
+        try:
+            # 强制转换 parentFolderId 为字符串，防止类型错误
+            response = self.session.post("https://cloud.189.cn/api/open/file/createFolder.action", data={
+                "parentFolderId": str(parentFolderId),
+                "folderName": name,
+            })
+            result = self._parse_json(response)
 
-        if result.get("res_code") != 0:
-            raise Exception(result.get("res_message"))
-        return result["id"]
+            if result.get("res_code") != 0:
+                # [修正] 如果没有 res_message，则返回完整 JSON 以便调试
+                error_info = result.get("res_message") or f"未知错误(完整响应: {result})"
+                raise Exception(error_info)
+            
+            return result["id"]
+        except Exception as e:
+            # 再次抛出异常给上层捕获
+            raise Exception(f"创建API请求失败: {str(e)}")
 
     def empty_recycle_bin(self):
         try:
