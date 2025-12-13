@@ -1,5 +1,6 @@
 import json
 import time
+import traceback
 from curl_cffi import requests
 from urllib import parse
 from concurrent.futures import ThreadPoolExecutor
@@ -1157,42 +1158,99 @@ def save_message(message_id, date, message_url, target_url, status, result):
         conn.close()
 
 def get_latest_messages():
+    # === 局部导入标准库，避免冲突 ===
+    import requests as std_requests
+    from bs4 import BeautifulSoup
+    from datetime import datetime
+    
     try:
-        channel_urls = os.getenv("ENV_189_TG_CHANNEL", "").split('|')
-        if not channel_urls or channel_urls == ['']: return []
+        # 读取配置
+        raw_channels = os.getenv("ENV_189_TG_CHANNEL", "")
+        # logger.info(f"正在读取天翼监控频道配置: '{raw_channels}'") 
+        
+        channel_urls = raw_channels.split('|')
+        if not channel_urls or channel_urls == ['']: 
+            return []
         
         all_new_messages = []
+        
         for channel_url in channel_urls:
             if not channel_url.strip(): continue
+            
+            # 处理 URL 格式
             if channel_url.startswith('https://t.me/') and '/s/' not in channel_url:
                 channel_url = f'https://t.me/s/{channel_url.split("https://t.me/")[-1]}'
 
-            session = requests.Session()
+            logger.info(f"===== [189] 处理频道: {channel_url} =====")
+
+            # 创建标准 Session
+            session = std_requests.Session()
             retry = Retry(total=RETRY_TIMES, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
             session.mount("https://", HTTPAdapter(max_retries=retry))
+            
             headers = {"User-Agent": USER_AGENTS[int(time.time()) % len(USER_AGENTS)]}
-            response = session.get(channel_url, headers=headers, timeout=TIMEOUT)
-            soup = BeautifulSoup(response.text, 'html.parser')
-            message_divs = soup.find_all('div', class_='tgme_widget_message')
-
-            for i in range(len(message_divs)):
-                msg = message_divs[len(message_divs) - 1 - i]
-                data_post = msg.get('data-post', '')
-                message_id = data_post.split('/')[-1] if data_post else f"未知_{i}"
+            
+            try:
+                # 发起请求
+                response = session.get(channel_url, headers=headers, timeout=TIMEOUT)
+                if response.status_code != 200:
+                    logger.warning(f"❌ [189] 请求频道失败: {response.status_code}")
+                    continue
                 
-                link_elem = msg.find('a', class_='tgme_widget_message_date')
-                message_url = f"{link_elem.get('href').lstrip('/')}" if link_elem else ''
-                text_elem = msg.find('div', class_='tgme_widget_message_text')
+                # 解析页面
+                soup = BeautifulSoup(response.text, 'html.parser')
+                message_divs = soup.find_all('div', class_='tgme_widget_message')
+                
+                total_msgs = len(message_divs)
+                logger.info(f"[189] 共解析到 {total_msgs} 条消息（最新的在最后）")
 
-                if text_elem:
-                    message_text = text_elem.get_text(strip=True).replace('\n', ' ')
-                    target_urls = extract_target_url(f"{msg}")
-                    for url in target_urls:
-                        if not is_message_processed(message_url):
-                            all_new_messages.append((message_id, datetime.now().isoformat(), message_url, url, message_text))
+                # 倒序遍历（从新到旧，但在列表中是顺序的）
+                # 注意：页面上是最下面的最新。我们按倒序处理，模拟 123bot 的逻辑
+                for i in range(total_msgs):
+                    # 索引转换：最新的消息在列表末尾
+                    msg_index = total_msgs - 1 - i
+                    msg = message_divs[msg_index]
+                    
+                    data_post = msg.get('data-post', '')
+                    message_id = data_post.split('/')[-1] if data_post else f"未知_{i}"
+                    
+                    logger.info(f"[189] 检查第 {i+1} 新消息（倒数第{i+1}条，ID: {message_id}）")
+                    
+                    # 检查是否已处理
+                    # 注意：这里需要先提取 url 才能查库，或者用 ID 查库
+                    # 为了保持逻辑一致，我们先提取内容
+                    
+                    link_elem = msg.find('a', class_='tgme_widget_message_date')
+                    message_url = f"{link_elem.get('href').lstrip('/')}" if link_elem else ''
+                    
+                    # 检查数据库去重 (基于 message_url)
+                    if is_message_processed(message_url):
+                        logger.info(f"[189] 第 {i+1} 新消息已处理，跳过")
+                        continue
+
+                    text_elem = msg.find('div', class_='tgme_widget_message_text')
+                    if text_elem:
+                        message_text = text_elem.get_text(strip=True).replace('\n', ' ')
+                        # 提取链接
+                        target_urls = extract_target_url(f"{msg}")
+                        
+                        if target_urls:
+                            for url in target_urls:
+                                logger.info(f"[189] 发现新链接: {url}")
+                                all_new_messages.append((message_id, datetime.now().isoformat(), message_url, url, message_text))
+                        else:
+                            pass
                             
+            except Exception as e:
+                logger.error(f"❌ [189] 处理频道异常: {e}")
+                continue
+
+        logger.info(f"===== [189] 所有频道共发现 {len(all_new_messages)} 条新的分享链接 =====")           
         return sorted(all_new_messages, key=lambda x: x[1])
-    except:
+        
+    except Exception as e:
+        logger.error(f"❌ 天翼监控严重崩溃: {e}")
+        logger.error(f"🔍 错误堆栈:\n{traceback.format_exc()}")
         return []
 
 def extract_target_url(text):
