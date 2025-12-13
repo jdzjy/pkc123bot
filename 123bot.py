@@ -41,7 +41,7 @@ logging.getLogger("httpx").setLevel(logging.ERROR)
 logging.getLogger("urllib3.connectionpool").setLevel(logging.ERROR)
 logging.getLogger("telebot").setLevel(logging.ERROR)
 
-version = "8.0.6"  
+version = "8.0.7"  
 newest_id = 50
 # 加载.env文件中的环境变量
 load_dotenv(dotenv_path="db/user.env",override=True)
